@@ -8,7 +8,7 @@ Console.OutputEncoding = Encoding.UTF8;
 
 const int serverPort = 5000;
 
-TcpListener listener = new TcpListener(IPAddress.Any, serverPort);
+TcpListener listener = new TcpListener(IPAddress.Loopback, serverPort);
 listener.Start();
 
 Console.WriteLine($"[SERVIDOR] À escuta na porta {serverPort}...");

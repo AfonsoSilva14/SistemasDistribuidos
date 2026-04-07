@@ -1,9 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading.Tasks;
 
 Console.OutputEncoding = Encoding.UTF8;
 
@@ -12,7 +14,11 @@ const string serverIp = "127.0.0.1";
 const int serverPort = 5000;
 const int gatewayPort = 6000;
 
-// Sensor simples "registado"
+const string sensoresFile = "sensores.txt";
+const string dadosRecebidosFile = "dados_recebidos.txt";
+const string agregadoFile = "agregado.txt";
+
+// Base simples de sensores registados
 var sensorDb = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCase)
 {
     ["S102"] = new SensorInfo
@@ -24,6 +30,9 @@ var sensorDb = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCa
         LastSync = DateTime.Now
     }
 };
+
+// Garante que o ficheiro de sensores existe logo ao arrancar
+GuardarSensores(sensorDb, sensoresFile);
 
 // Liga ao servidor
 TcpClient serverClient = new TcpClient();
@@ -38,17 +47,25 @@ serverWriter.WriteLine($"GW_HELLO|{gatewayId}|{localIp}");
 Console.WriteLine("[GATEWAY] Enviado ao servidor: GW_HELLO");
 Console.WriteLine("[GATEWAY] Resposta do servidor: " + serverReader.ReadLine());
 
-// Fica à escuta para sensores
-TcpListener listener = new TcpListener(IPAddress.Any, gatewayPort);
+// Fica à escuta local para sensores
+TcpListener listener = new TcpListener(IPAddress.Loopback, gatewayPort);
 listener.Start();
 
-Console.WriteLine($"[GATEWAY] À escuta de sensores na porta {gatewayPort}...");
+Console.WriteLine($"[GATEWAY] À escuta de sensores em 127.0.0.1:{gatewayPort}...");
 
 while (true)
 {
     TcpClient sensorClient = listener.AcceptTcpClient();
     Console.WriteLine("[GATEWAY] Sensor ligado.");
-    _ = Task.Run(() => HandleSensor(sensorClient, sensorDb, gatewayId, serverWriter, serverReader));
+    _ = Task.Run(() => HandleSensor(
+        sensorClient,
+        sensorDb,
+        gatewayId,
+        serverWriter,
+        serverReader,
+        sensoresFile,
+        dadosRecebidosFile,
+        agregadoFile));
 }
 
 static void HandleSensor(
@@ -56,7 +73,10 @@ static void HandleSensor(
     Dictionary<string, SensorInfo> sensorDb,
     string gatewayId,
     StreamWriter serverWriter,
-    StreamReader serverReader)
+    StreamReader serverReader,
+    string sensoresFile,
+    string dadosRecebidosFile,
+    string agregadoFile)
 {
     try
     {
@@ -102,10 +122,11 @@ static void HandleSensor(
 
                         if (!sensor.Estado.Equals("ativo", StringComparison.OrdinalIgnoreCase))
                         {
-                            string reason = sensor.Estado.Equals("manutenção", StringComparison.OrdinalIgnoreCase) ||
-                                            sensor.Estado.Equals("manutencao", StringComparison.OrdinalIgnoreCase)
-                                ? "MAINTENANCE"
-                                : "DISABLED";
+                            string reason =
+                                sensor.Estado.Equals("manutenção", StringComparison.OrdinalIgnoreCase) ||
+                                sensor.Estado.Equals("manutencao", StringComparison.OrdinalIgnoreCase)
+                                    ? "MAINTENANCE"
+                                    : "DISABLED";
 
                             writer.WriteLine($"AUTH_FAIL|{sensorId}|{reason}");
                             break;
@@ -120,6 +141,8 @@ static void HandleSensor(
                         currentSensorId = sensorId;
                         authenticated = true;
                         sensor.LastSync = DateTime.Now;
+
+                        GuardarSensores(sensorDb, sensoresFile);
 
                         writer.WriteLine($"AUTH_OK|{sensorId}|{sensor.Estado}|{sensor.Zona}");
                         break;
@@ -153,10 +176,12 @@ static void HandleSensor(
 
                         foreach (string tipo in tipos)
                         {
-                            if (sensor.TiposSuportados.Contains(tipo))
-                                registeredTypes.Add(tipo);
+                            string tipoNormalizado = tipo.Trim().ToUpperInvariant();
+
+                            if (sensor.TiposSuportados.Contains(tipoNormalizado))
+                                registeredTypes.Add(tipoNormalizado);
                             else
-                                invalidos.Add(tipo);
+                                invalidos.Add(tipoNormalizado);
                         }
 
                         if (invalidos.Count > 0)
@@ -186,9 +211,9 @@ static void HandleSensor(
 
                         string sensorId = parts[1];
                         string timestamp = parts[2];
-                        string tipo = parts[3];
-                        string valor = parts[4];
-                        string unidade = parts[5];
+                        string tipo = parts[3].Trim().ToUpperInvariant();
+                        string valorTexto = parts[4].Trim();
+                        string unidade = parts[5].Trim();
 
                         if (!sensorId.Equals(currentSensorId, StringComparison.OrdinalIgnoreCase))
                         {
@@ -202,15 +227,36 @@ static void HandleSensor(
                             break;
                         }
 
+                        // Pré-processamento do valor
+                        if (!TentarLerDouble(valorTexto, out double valor))
+                        {
+                            writer.WriteLine($"DATA_NACK|{sensorId}|{timestamp}|INVALID_VALUE");
+                            break;
+                        }
+
+                        valor = Math.Round(valor, 2);
+
                         SensorInfo sensor = sensorDb[currentSensorId];
                         sensor.LastSync = DateTime.Now;
 
-                        string localLog = $"{timestamp}|{sensorId}|{sensor.Zona}|{tipo}|{valor}|{unidade}";
-                        File.AppendAllText("dados_gateway.txt", localLog + Environment.NewLine);
+                        // Atualiza ficheiro de sensores
+                        GuardarSensores(sensorDb, sensoresFile);
 
+                        // Guarda dado recebido já tratado
+                        string linhaDado =
+                            $"{timestamp}|{sensorId}|{sensor.Zona}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
+                        File.AppendAllText(dadosRecebidosFile, linhaDado + Environment.NewLine);
+
+                        // Atualiza agregado
+                        AtualizarAgregado(agregadoFile, sensorId, tipo, valor);
+
+                        // Responde ao sensor
                         writer.WriteLine($"DATA_ACK|{sensorId}|{timestamp}|OK");
 
-                        string gwData = $"GW_DATA|{gatewayId}|{sensorId}|{sensor.Zona}|{timestamp}|{tipo}|{valor}|{unidade}";
+                        // Encaminha ao servidor
+                        string gwData =
+                            $"GW_DATA|{gatewayId}|{sensorId}|{sensor.Zona}|{timestamp}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
+
                         lock (serverWriter)
                         {
                             serverWriter.WriteLine(gwData);
@@ -242,6 +288,8 @@ static void HandleSensor(
 
                         string timestamp = parts[2];
                         sensorDb[currentSensorId].LastSync = DateTime.Now;
+                        GuardarSensores(sensorDb, sensoresFile);
+
                         writer.WriteLine($"HEARTBEAT_ACK|{currentSensorId}|{timestamp}|OK");
                         break;
                     }
@@ -256,6 +304,7 @@ static void HandleSensor(
 
                         string sensorId = parts[1];
                         string timestamp = parts[2];
+
                         writer.WriteLine($"BYE_ACK|{sensorId}|{timestamp}|OK");
                         Console.WriteLine("[GATEWAY] Sensor terminou comunicação.");
                         return;
@@ -276,6 +325,78 @@ static void HandleSensor(
         client.Close();
         Console.WriteLine("[GATEWAY] Ligação ao sensor fechada.");
     }
+}
+
+static bool TentarLerDouble(string texto, out double valor)
+{
+    return double.TryParse(texto, NumberStyles.Any, CultureInfo.InvariantCulture, out valor) ||
+           double.TryParse(texto, NumberStyles.Any, new CultureInfo("pt-PT"), out valor);
+}
+
+static void GuardarSensores(Dictionary<string, SensorInfo> sensorDb, string sensoresFile)
+{
+    List<string> linhas = new();
+
+    foreach (var sensor in sensorDb.Values)
+    {
+        string tipos = string.Join(",", sensor.TiposSuportados);
+        string linha =
+            $"{sensor.SensorId};{sensor.Estado};{sensor.Zona};{tipos};{sensor.LastSync:yyyy-MM-ddTHH:mm:ss}";
+        linhas.Add(linha);
+    }
+
+    File.WriteAllLines(sensoresFile, linhas);
+}
+
+static void AtualizarAgregado(string agregadoFile, string sensorId, string tipo, double novoValor)
+{
+    var agregados = new Dictionary<string, (int Quantidade, double Soma)>(StringComparer.OrdinalIgnoreCase);
+
+    if (File.Exists(agregadoFile))
+    {
+        string[] linhas = File.ReadAllLines(agregadoFile);
+
+        foreach (string linha in linhas)
+        {
+            string[] parts = linha.Split('|');
+            if (parts.Length == 4)
+            {
+                string sId = parts[0];
+                string t = parts[1];
+                int quantidade = int.Parse(parts[2]);
+                double media = double.Parse(parts[3], CultureInfo.InvariantCulture);
+
+                agregados[$"{sId}|{t}"] = (quantidade, media * quantidade);
+            }
+        }
+    }
+
+    string chave = $"{sensorId}|{tipo}";
+
+    if (agregados.ContainsKey(chave))
+    {
+        var atual = agregados[chave];
+        agregados[chave] = (atual.Quantidade + 1, atual.Soma + novoValor);
+    }
+    else
+    {
+        agregados[chave] = (1, novoValor);
+    }
+
+    List<string> novasLinhas = new();
+
+    foreach (var item in agregados)
+    {
+        string[] partes = item.Key.Split('|');
+        string sId = partes[0];
+        string t = partes[1];
+        int quantidade = item.Value.Quantidade;
+        double media = item.Value.Soma / quantidade;
+
+        novasLinhas.Add($"{sId}|{t}|{quantidade}|{media.ToString("F2", CultureInfo.InvariantCulture)}");
+    }
+
+    File.WriteAllLines(agregadoFile, novasLinhas);
 }
 
 class SensorInfo
