@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
+using Microsoft.Data.SqlClient;
 
 Console.OutputEncoding = Encoding.UTF8;
 
@@ -17,6 +18,10 @@ const int gatewayPort = 6000;
 const string sensoresFile = "sensores.txt";
 const string dadosRecebidosFile = "dados_recebidos.txt";
 const string agregadoFile = "agregado.txt";
+
+const string dbName = "OneHealthDB";
+const string masterConnectionString = @"Server=(localdb)\MSSQLLocalDB;Integrated Security=true;TrustServerCertificate=true;";
+string dbConnectionString = $@"Server=(localdb)\MSSQLLocalDB;Database={dbName};Integrated Security=true;TrustServerCertificate=true;";
 
 // Base simples de sensores registados
 var sensorDb = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCase)
@@ -31,12 +36,23 @@ var sensorDb = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCa
     }
 };
 
-// Garante que o ficheiro de sensores existe logo ao arrancar
+// Garante que os ficheiros e BD existem logo ao arrancar
 GuardarSensores(sensorDb, sensoresFile);
+InicializarBaseDeDados(masterConnectionString, dbName, dbConnectionString);
+GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
 
 // Liga ao servidor
 TcpClient serverClient = new TcpClient();
-serverClient.Connect(serverIp, serverPort);
+
+try
+{
+    serverClient.Connect(serverIp, serverPort);
+}
+catch (SocketException)
+{
+    Console.WriteLine("[GATEWAY] Não foi possível ligar ao servidor. Confirma se o Servidor está em execução na porta 5000.");
+    return;
+}
 
 NetworkStream serverNs = serverClient.GetStream();
 StreamReader serverReader = new StreamReader(serverNs, Encoding.UTF8);
@@ -65,7 +81,8 @@ while (true)
         serverReader,
         sensoresFile,
         dadosRecebidosFile,
-        agregadoFile));
+        agregadoFile,
+        dbConnectionString));
 }
 
 static void HandleSensor(
@@ -76,7 +93,8 @@ static void HandleSensor(
     StreamReader serverReader,
     string sensoresFile,
     string dadosRecebidosFile,
-    string agregadoFile)
+    string agregadoFile,
+    string dbConnectionString)
 {
     try
     {
@@ -143,6 +161,7 @@ static void HandleSensor(
                         sensor.LastSync = DateTime.Now;
 
                         GuardarSensores(sensorDb, sensoresFile);
+                        GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
 
                         writer.WriteLine($"AUTH_OK|{sensorId}|{sensor.Estado}|{sensor.Zona}");
                         break;
@@ -227,7 +246,6 @@ static void HandleSensor(
                             break;
                         }
 
-                        // Pré-processamento do valor
                         if (!TentarLerDouble(valorTexto, out double valor))
                         {
                             writer.WriteLine($"DATA_NACK|{sensorId}|{timestamp}|INVALID_VALUE");
@@ -239,21 +257,27 @@ static void HandleSensor(
                         SensorInfo sensor = sensorDb[currentSensorId];
                         sensor.LastSync = DateTime.Now;
 
-                        // Atualiza ficheiro de sensores
                         GuardarSensores(sensorDb, sensoresFile);
+                        GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
 
-                        // Guarda dado recebido já tratado
                         string linhaDado =
                             $"{timestamp}|{sensorId}|{sensor.Zona}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
                         File.AppendAllText(dadosRecebidosFile, linhaDado + Environment.NewLine);
 
-                        // Atualiza agregado
                         AtualizarAgregado(agregadoFile, sensorId, tipo, valor);
 
-                        // Responde ao sensor
+                        GuardarMedicaoGatewayNaBaseDeDados(
+                            dbConnectionString,
+                            timestamp,
+                            gatewayId,
+                            sensorId,
+                            sensor.Zona,
+                            tipo,
+                            valor,
+                            unidade);
+
                         writer.WriteLine($"DATA_ACK|{sensorId}|{timestamp}|OK");
 
-                        // Encaminha ao servidor
                         string gwData =
                             $"GW_DATA|{gatewayId}|{sensorId}|{sensor.Zona}|{timestamp}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
 
@@ -288,7 +312,9 @@ static void HandleSensor(
 
                         string timestamp = parts[2];
                         sensorDb[currentSensorId].LastSync = DateTime.Now;
+
                         GuardarSensores(sensorDb, sensoresFile);
+                        GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
 
                         writer.WriteLine($"HEARTBEAT_ACK|{currentSensorId}|{timestamp}|OK");
                         break;
@@ -397,6 +423,122 @@ static void AtualizarAgregado(string agregadoFile, string sensorId, string tipo,
     }
 
     File.WriteAllLines(agregadoFile, novasLinhas);
+}
+
+static void InicializarBaseDeDados(string masterConnectionString, string dbName, string dbConnectionString)
+{
+    using (var connection = new SqlConnection(masterConnectionString))
+    {
+        connection.Open();
+
+        string createDbSql = $@"
+IF DB_ID('{dbName}') IS NULL
+BEGIN
+    CREATE DATABASE [{dbName}]
+END";
+
+        using var cmd = new SqlCommand(createDbSql, connection);
+        cmd.ExecuteNonQuery();
+    }
+
+    using (var connection = new SqlConnection(dbConnectionString))
+    {
+        connection.Open();
+
+        string createTablesSql = @"
+IF OBJECT_ID('Sensores', 'U') IS NULL
+BEGIN
+    CREATE TABLE Sensores (
+        SensorId NVARCHAR(50) PRIMARY KEY,
+        Estado NVARCHAR(50) NOT NULL,
+        Zona NVARCHAR(100) NOT NULL,
+        TiposSuportados NVARCHAR(200) NOT NULL,
+        LastSync DATETIME NOT NULL
+    )
+END
+
+IF OBJECT_ID('MedicoesGateway', 'U') IS NULL
+BEGIN
+    CREATE TABLE MedicoesGateway (
+        Id INT IDENTITY(1,1) PRIMARY KEY,
+        TimestampMedicao DATETIME NOT NULL,
+        GatewayId NVARCHAR(50) NOT NULL,
+        SensorId NVARCHAR(50) NOT NULL,
+        Zona NVARCHAR(100) NOT NULL,
+        Tipo NVARCHAR(50) NOT NULL,
+        Valor FLOAT NOT NULL,
+        Unidade NVARCHAR(50) NOT NULL
+    )
+END";
+
+        using var cmd = new SqlCommand(createTablesSql, connection);
+        cmd.ExecuteNonQuery();
+    }
+}
+
+static void GuardarSensoresNaBaseDeDados(Dictionary<string, SensorInfo> sensorDb, string connectionString)
+{
+    using var connection = new SqlConnection(connectionString);
+    connection.Open();
+
+    foreach (var sensor in sensorDb.Values)
+    {
+        string sql = @"
+IF EXISTS (SELECT 1 FROM Sensores WHERE SensorId = @SensorId)
+BEGIN
+    UPDATE Sensores
+    SET Estado = @Estado,
+        Zona = @Zona,
+        TiposSuportados = @TiposSuportados,
+        LastSync = @LastSync
+    WHERE SensorId = @SensorId
+END
+ELSE
+BEGIN
+    INSERT INTO Sensores (SensorId, Estado, Zona, TiposSuportados, LastSync)
+    VALUES (@SensorId, @Estado, @Zona, @TiposSuportados, @LastSync)
+END";
+
+        using var cmd = new SqlCommand(sql, connection);
+        cmd.Parameters.AddWithValue("@SensorId", sensor.SensorId);
+        cmd.Parameters.AddWithValue("@Estado", sensor.Estado);
+        cmd.Parameters.AddWithValue("@Zona", sensor.Zona);
+        cmd.Parameters.AddWithValue("@TiposSuportados", string.Join(",", sensor.TiposSuportados));
+        cmd.Parameters.AddWithValue("@LastSync", sensor.LastSync);
+
+        cmd.ExecuteNonQuery();
+    }
+}
+
+static void GuardarMedicaoGatewayNaBaseDeDados(
+    string connectionString,
+    string timestamp,
+    string gatewayId,
+    string sensorId,
+    string zona,
+    string tipo,
+    double valor,
+    string unidade)
+{
+    using var connection = new SqlConnection(connectionString);
+    connection.Open();
+
+    string sql = @"
+INSERT INTO MedicoesGateway
+    (TimestampMedicao, GatewayId, SensorId, Zona, Tipo, Valor, Unidade)
+VALUES
+    (@TimestampMedicao, @GatewayId, @SensorId, @Zona, @Tipo, @Valor, @Unidade)";
+
+    using var cmd = new SqlCommand(sql, connection);
+    cmd.Parameters.AddWithValue("@TimestampMedicao", DateTime.Parse(timestamp));
+    cmd.Parameters.AddWithValue("@GatewayId", gatewayId);
+    cmd.Parameters.AddWithValue("@SensorId", sensorId);
+    cmd.Parameters.AddWithValue("@Zona", zona);
+    cmd.Parameters.AddWithValue("@Tipo", tipo);
+    cmd.Parameters.AddWithValue("@Valor", valor);
+    cmd.Parameters.AddWithValue("@Unidade", unidade);
+
+    cmd.ExecuteNonQuery();
 }
 
 class SensorInfo
