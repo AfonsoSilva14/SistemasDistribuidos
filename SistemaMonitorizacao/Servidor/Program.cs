@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -9,10 +10,12 @@ using Microsoft.Data.SqlClient;
 Console.OutputEncoding = Encoding.UTF8;
 
 const int serverPort = 5000;
-
 const string dbName = "OneHealthDB";
 const string masterConnectionString = @"Server=(localdb)\MSSQLLocalDB;Integrated Security=true;TrustServerCertificate=true;";
 string dbConnectionString = $@"Server=(localdb)\MSSQLLocalDB;Database={dbName};Integrated Security=true;TrustServerCertificate=true;";
+
+// Objeto de exclusão mútua para o ficheiro
+object fileLock = new object();
 
 InicializarBaseDeDados(masterConnectionString, dbName, dbConnectionString);
 
@@ -26,10 +29,10 @@ while (true)
     TcpClient gatewayClient = listener.AcceptTcpClient();
     Console.WriteLine("[SERVIDOR] Gateway ligado.");
 
-    _ = Task.Run(() => HandleGateway(gatewayClient, dbConnectionString));
+    _ = Task.Run(() => HandleGateway(gatewayClient, dbConnectionString, fileLock));
 }
 
-static void HandleGateway(TcpClient client, string dbConnectionString)
+static void HandleGateway(TcpClient client, string dbConnectionString, object fileLock)
 {
     try
     {
@@ -74,7 +77,11 @@ static void HandleGateway(TcpClient client, string dbConnectionString)
                             string unidade = parts[7];
 
                             string logLine = $"{timestamp}|{gatewayId}|{sensorId}|{zona}|{tipo}|{valor}|{unidade}";
-                            File.AppendAllText("dados_servidor.txt", logLine + Environment.NewLine);
+
+                            lock (fileLock)
+                            {
+                                File.AppendAllText("dados_servidor.txt", logLine + Environment.NewLine);
+                            }
 
                             GuardarMedicaoServidorNaBaseDeDados(
                                 dbConnectionString,
@@ -195,7 +202,7 @@ static void GuardarMedicaoServidorNaBaseDeDados(
     string valorTexto,
     string unidade)
 {
-    double valor = double.Parse(valorTexto, System.Globalization.CultureInfo.InvariantCulture);
+    double valor = double.Parse(valorTexto, CultureInfo.InvariantCulture);
 
     using var connection = new SqlConnection(connectionString);
     connection.Open();

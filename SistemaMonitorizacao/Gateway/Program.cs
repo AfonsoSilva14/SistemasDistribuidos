@@ -23,7 +23,13 @@ const string dbName = "OneHealthDB";
 const string masterConnectionString = @"Server=(localdb)\MSSQLLocalDB;Integrated Security=true;TrustServerCertificate=true;";
 string dbConnectionString = $@"Server=(localdb)\MSSQLLocalDB;Database={dbName};Integrated Security=true;TrustServerCertificate=true;";
 
-// Base simples de sensores registados
+// Locks
+object sensorDbLock = new object();
+object sensoresFileLock = new object();
+object dadosRecebidosFileLock = new object();
+object agregadoFileLock = new object();
+object serverConnectionLock = new object();
+
 var sensorDb = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCase)
 {
     ["S102"] = new SensorInfo
@@ -31,17 +37,23 @@ var sensorDb = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCa
         SensorId = "S102",
         Estado = "ativo",
         Zona = "ZONA_ESCOLAR",
-        TiposSuportados = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "TEMP", "PM25" },
+        TiposSuportados = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "TEMP", "PM25", "HUM", "CO2", "PRESS" },
         LastSync = DateTime.Now
     }
 };
 
-// Garante que os ficheiros e BD existem logo ao arrancar
-GuardarSensores(sensorDb, sensoresFile);
-InicializarBaseDeDados(masterConnectionString, dbName, dbConnectionString);
-GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
+lock (sensoresFileLock)
+{
+    GuardarSensores(sensorDb, sensoresFile);
+}
 
-// Liga ao servidor
+InicializarBaseDeDados(masterConnectionString, dbName, dbConnectionString);
+
+lock (sensorDbLock)
+{
+    GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
+}
+
 TcpClient serverClient = new TcpClient();
 
 try
@@ -59,11 +71,14 @@ StreamReader serverReader = new StreamReader(serverNs, Encoding.UTF8);
 StreamWriter serverWriter = new StreamWriter(serverNs, Encoding.UTF8) { AutoFlush = true };
 
 string localIp = "127.0.0.1";
-serverWriter.WriteLine($"GW_HELLO|{gatewayId}|{localIp}");
-Console.WriteLine("[GATEWAY] Enviado ao servidor: GW_HELLO");
-Console.WriteLine("[GATEWAY] Resposta do servidor: " + serverReader.ReadLine());
 
-// Fica à escuta local para sensores
+lock (serverConnectionLock)
+{
+    serverWriter.WriteLine($"GW_HELLO|{gatewayId}|{localIp}");
+    Console.WriteLine("[GATEWAY] Enviado ao servidor: GW_HELLO");
+    Console.WriteLine("[GATEWAY] Resposta do servidor: " + serverReader.ReadLine());
+}
+
 TcpListener listener = new TcpListener(IPAddress.Loopback, gatewayPort);
 listener.Start();
 
@@ -73,6 +88,7 @@ while (true)
 {
     TcpClient sensorClient = listener.AcceptTcpClient();
     Console.WriteLine("[GATEWAY] Sensor ligado.");
+
     _ = Task.Run(() => HandleSensor(
         sensorClient,
         sensorDb,
@@ -82,7 +98,12 @@ while (true)
         sensoresFile,
         dadosRecebidosFile,
         agregadoFile,
-        dbConnectionString));
+        dbConnectionString,
+        sensorDbLock,
+        sensoresFileLock,
+        dadosRecebidosFileLock,
+        agregadoFileLock,
+        serverConnectionLock));
 }
 
 static void HandleSensor(
@@ -94,7 +115,12 @@ static void HandleSensor(
     string sensoresFile,
     string dadosRecebidosFile,
     string agregadoFile,
-    string dbConnectionString)
+    string dbConnectionString,
+    object sensorDbLock,
+    object sensoresFileLock,
+    object dadosRecebidosFileLock,
+    object agregadoFileLock,
+    object serverConnectionLock)
 {
     try
     {
@@ -130,40 +156,51 @@ static void HandleSensor(
 
                         writer.WriteLine($"HELLO_ACK|{gatewayId}|OK");
 
-                        if (!sensorDb.ContainsKey(sensorId))
+                        SensorInfo? sensor;
+                        lock (sensorDbLock)
                         {
-                            writer.WriteLine($"AUTH_FAIL|{sensorId}|NOT_REGISTERED");
-                            break;
+                            if (!sensorDb.ContainsKey(sensorId))
+                            {
+                                writer.WriteLine($"AUTH_FAIL|{sensorId}|NOT_REGISTERED");
+                                break;
+                            }
+
+                            sensor = sensorDb[sensorId];
+
+                            if (!sensor.Estado.Equals("ativo", StringComparison.OrdinalIgnoreCase))
+                            {
+                                string reason =
+                                    sensor.Estado.Equals("manutenção", StringComparison.OrdinalIgnoreCase) ||
+                                    sensor.Estado.Equals("manutencao", StringComparison.OrdinalIgnoreCase)
+                                        ? "MAINTENANCE"
+                                        : "DISABLED";
+
+                                writer.WriteLine($"AUTH_FAIL|{sensorId}|{reason}");
+                                break;
+                            }
+
+                            if (!sensor.Zona.Equals(zona, StringComparison.OrdinalIgnoreCase))
+                            {
+                                writer.WriteLine($"AUTH_FAIL|{sensorId}|INVALID_ZONE");
+                                break;
+                            }
+
+                            currentSensorId = sensorId;
+                            authenticated = true;
+                            sensor.LastSync = DateTime.Now;
                         }
 
-                        var sensor = sensorDb[sensorId];
-
-                        if (!sensor.Estado.Equals("ativo", StringComparison.OrdinalIgnoreCase))
+                        lock (sensoresFileLock)
                         {
-                            string reason =
-                                sensor.Estado.Equals("manutenção", StringComparison.OrdinalIgnoreCase) ||
-                                sensor.Estado.Equals("manutencao", StringComparison.OrdinalIgnoreCase)
-                                    ? "MAINTENANCE"
-                                    : "DISABLED";
-
-                            writer.WriteLine($"AUTH_FAIL|{sensorId}|{reason}");
-                            break;
+                            GuardarSensores(sensorDb, sensoresFile);
                         }
 
-                        if (!sensor.Zona.Equals(zona, StringComparison.OrdinalIgnoreCase))
+                        lock (sensorDbLock)
                         {
-                            writer.WriteLine($"AUTH_FAIL|{sensorId}|INVALID_ZONE");
-                            break;
+                            GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
                         }
 
-                        currentSensorId = sensorId;
-                        authenticated = true;
-                        sensor.LastSync = DateTime.Now;
-
-                        GuardarSensores(sensorDb, sensoresFile);
-                        GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
-
-                        writer.WriteLine($"AUTH_OK|{sensorId}|{sensor.Estado}|{sensor.Zona}");
+                        writer.WriteLine($"AUTH_OK|{sensorId}|ativo|{zona}");
                         break;
                     }
 
@@ -190,17 +227,21 @@ static void HandleSensor(
                             break;
                         }
 
-                        var sensor = sensorDb[currentSensorId];
                         List<string> invalidos = new();
 
-                        foreach (string tipo in tipos)
+                        lock (sensorDbLock)
                         {
-                            string tipoNormalizado = tipo.Trim().ToUpperInvariant();
+                            var sensor = sensorDb[currentSensorId];
 
-                            if (sensor.TiposSuportados.Contains(tipoNormalizado))
-                                registeredTypes.Add(tipoNormalizado);
-                            else
-                                invalidos.Add(tipoNormalizado);
+                            foreach (string tipo in tipos)
+                            {
+                                string tipoNormalizado = tipo.Trim().ToUpperInvariant();
+
+                                if (sensor.TiposSuportados.Contains(tipoNormalizado))
+                                    registeredTypes.Add(tipoNormalizado);
+                                else
+                                    invalidos.Add(tipoNormalizado);
+                            }
                         }
 
                         if (invalidos.Count > 0)
@@ -252,26 +293,52 @@ static void HandleSensor(
                             break;
                         }
 
+                        if (!UnidadeValida(tipo, unidade))
+                        {
+                            writer.WriteLine($"DATA_NACK|{sensorId}|{timestamp}|INVALID_UNIT");
+                            break;
+                        }
+
                         valor = Math.Round(valor, 2);
 
-                        SensorInfo sensor = sensorDb[currentSensorId];
-                        sensor.LastSync = DateTime.Now;
+                        string zonaSensor;
 
-                        GuardarSensores(sensorDb, sensoresFile);
-                        GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
+                        lock (sensorDbLock)
+                        {
+                            SensorInfo sensor = sensorDb[currentSensorId];
+                            sensor.LastSync = DateTime.Now;
+                            zonaSensor = sensor.Zona;
+                        }
+
+                        lock (sensoresFileLock)
+                        {
+                            GuardarSensores(sensorDb, sensoresFile);
+                        }
+
+                        lock (sensorDbLock)
+                        {
+                            GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
+                        }
 
                         string linhaDado =
-                            $"{timestamp}|{sensorId}|{sensor.Zona}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
-                        File.AppendAllText(dadosRecebidosFile, linhaDado + Environment.NewLine);
+                            $"{timestamp}|{sensorId}|{zonaSensor}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
 
-                        AtualizarAgregado(agregadoFile, sensorId, tipo, valor);
+                        lock (dadosRecebidosFileLock)
+                        {
+                            File.AppendAllText(dadosRecebidosFile, linhaDado + Environment.NewLine);
+                        }
+
+                        lock (agregadoFileLock)
+                        {
+                            AtualizarAgregado(agregadoFile, sensorId, tipo, valor);
+                        }
 
                         GuardarMedicaoGatewayNaBaseDeDados(
                             dbConnectionString,
                             timestamp,
                             gatewayId,
                             sensorId,
-                            sensor.Zona,
+                            zonaSensor,
                             tipo,
                             valor,
                             unidade);
@@ -279,16 +346,12 @@ static void HandleSensor(
                         writer.WriteLine($"DATA_ACK|{sensorId}|{timestamp}|OK");
 
                         string gwData =
-                            $"GW_DATA|{gatewayId}|{sensorId}|{sensor.Zona}|{timestamp}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
-
-                        lock (serverWriter)
-                        {
-                            serverWriter.WriteLine(gwData);
-                        }
+                            $"GW_DATA|{gatewayId}|{sensorId}|{zonaSensor}|{timestamp}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
 
                         string? serverResponse;
-                        lock (serverReader)
+                        lock (serverConnectionLock)
                         {
+                            serverWriter.WriteLine(gwData);
                             serverResponse = serverReader.ReadLine();
                         }
 
@@ -311,10 +374,21 @@ static void HandleSensor(
                         }
 
                         string timestamp = parts[2];
-                        sensorDb[currentSensorId].LastSync = DateTime.Now;
 
-                        GuardarSensores(sensorDb, sensoresFile);
-                        GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
+                        lock (sensorDbLock)
+                        {
+                            sensorDb[currentSensorId].LastSync = DateTime.Now;
+                        }
+
+                        lock (sensoresFileLock)
+                        {
+                            GuardarSensores(sensorDb, sensoresFile);
+                        }
+
+                        lock (sensorDbLock)
+                        {
+                            GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
+                        }
 
                         writer.WriteLine($"HEARTBEAT_ACK|{currentSensorId}|{timestamp}|OK");
                         break;
@@ -357,6 +431,27 @@ static bool TentarLerDouble(string texto, out double valor)
 {
     return double.TryParse(texto, NumberStyles.Any, CultureInfo.InvariantCulture, out valor) ||
            double.TryParse(texto, NumberStyles.Any, new CultureInfo("pt-PT"), out valor);
+}
+
+static bool UnidadeValida(string tipo, string unidade)
+{
+    return tipo.ToUpperInvariant() switch
+    {
+        "TEMP" => unidade.Equals("C", StringComparison.OrdinalIgnoreCase) ||
+                  unidade.Equals("ºC", StringComparison.OrdinalIgnoreCase),
+
+        "PM25" => unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
+                  unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
+
+        "HUM" => unidade.Equals("%", StringComparison.OrdinalIgnoreCase),
+
+        "CO2" => unidade.Equals("ppm", StringComparison.OrdinalIgnoreCase),
+
+        "PRESS" => unidade.Equals("hPa", StringComparison.OrdinalIgnoreCase) ||
+                   unidade.Equals("Pa", StringComparison.OrdinalIgnoreCase),
+
+        _ => false
+    };
 }
 
 static void GuardarSensores(Dictionary<string, SensorInfo> sensorDb, string sensoresFile)
