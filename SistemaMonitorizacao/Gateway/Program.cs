@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -6,7 +6,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
-using Microsoft.Data.SqlClient;
+using Microsoft.Data.Sqlite;
 
 Console.OutputEncoding = Encoding.UTF8;
 
@@ -14,14 +14,13 @@ const string gatewayId = "GW01";
 const string serverIp = "127.0.0.1";
 const int serverPort = 5000;
 const int gatewayPort = 6000;
+const int heartbeatTimeoutSeconds = 60; // sensor sem heartbeat há 60s → manutenção
 
 const string sensoresFile = "sensores.txt";
 const string dadosRecebidosFile = "dados_recebidos.txt";
 const string agregadoFile = "agregado.txt";
 
-const string dbName = "OneHealthDB";
-const string masterConnectionString = @"Server=(localdb)\MSSQLLocalDB;Integrated Security=true;TrustServerCertificate=true;";
-string dbConnectionString = $@"Server=(localdb)\MSSQLLocalDB;Database={dbName};Integrated Security=true;TrustServerCertificate=true;";
+string dbConnectionString = "Data Source=gateway.db";
 
 // Locks
 object sensorDbLock = new object();
@@ -37,7 +36,8 @@ var sensorDb = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCa
         SensorId = "S102",
         Estado = "ativo",
         Zona = "ZONA_ESCOLAR",
-        TiposSuportados = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "TEMP", "PM25", "HUM", "CO2", "PRESS" },
+        TiposSuportados = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "TEMP", "PM25", "PM2.5", "PM10", "HUM", "CO2", "PRESS", "RUIDO", "AR", "LUZ" },
         LastSync = DateTime.Now
     }
 };
@@ -47,7 +47,7 @@ lock (sensoresFileLock)
     GuardarSensores(sensorDb, sensoresFile);
 }
 
-InicializarBaseDeDados(masterConnectionString, dbName, dbConnectionString);
+InicializarBaseDeDados(dbConnectionString);
 
 lock (sensorDbLock)
 {
@@ -78,6 +78,46 @@ lock (serverConnectionLock)
     Console.WriteLine("[GATEWAY] Enviado ao servidor: GW_HELLO");
     Console.WriteLine("[GATEWAY] Resposta do servidor: " + serverReader.ReadLine());
 }
+
+// Deteção de sensores sem heartbeat (executa em background a cada 30s)
+_ = Task.Run(async () =>
+{
+    while (true)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(30));
+        var now = DateTime.Now;
+        bool changed = false;
+
+        lock (sensorDbLock)
+        {
+            foreach (var sensor in sensorDb.Values)
+            {
+                if (sensor.Estado.Equals("ativo", StringComparison.OrdinalIgnoreCase))
+                {
+                    double elapsed = (now - sensor.LastSync).TotalSeconds;
+                    if (elapsed > heartbeatTimeoutSeconds)
+                    {
+                        Console.WriteLine($"[GATEWAY] Sensor {sensor.SensorId} sem heartbeat há {elapsed:F0}s → marcado como manutenção.");
+                        sensor.Estado = "manutenção";
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if (changed)
+        {
+            lock (sensoresFileLock)
+            {
+                GuardarSensores(sensorDb, sensoresFile);
+            }
+            lock (sensorDbLock)
+            {
+                GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
+            }
+        }
+    }
+});
 
 TcpListener listener = new TcpListener(IPAddress.Loopback, gatewayPort);
 listener.Start();
@@ -235,12 +275,13 @@ static void HandleSensor(
 
                             foreach (string tipo in tipos)
                             {
-                                string tipoNormalizado = tipo.Trim().ToUpperInvariant();
+                                string tipoNorm = NormalizarTipo(tipo.Trim());
 
-                                if (sensor.TiposSuportados.Contains(tipoNormalizado))
-                                    registeredTypes.Add(tipoNormalizado);
+                                if (sensor.TiposSuportados.Contains(tipoNorm) ||
+                                    sensor.TiposSuportados.Contains(tipo.Trim()))
+                                    registeredTypes.Add(tipoNorm);
                                 else
-                                    invalidos.Add(tipoNormalizado);
+                                    invalidos.Add(tipoNorm);
                             }
                         }
 
@@ -271,7 +312,7 @@ static void HandleSensor(
 
                         string sensorId = parts[1];
                         string timestamp = parts[2];
-                        string tipo = parts[3].Trim().ToUpperInvariant();
+                        string tipo = NormalizarTipo(parts[3].Trim());
                         string valorTexto = parts[4].Trim();
                         string unidade = parts[5].Trim();
 
@@ -427,6 +468,16 @@ static void HandleSensor(
     }
 }
 
+// Normaliza nomes de tipos: PM2.5 → PM25
+static string NormalizarTipo(string tipo)
+{
+    return tipo.ToUpperInvariant() switch
+    {
+        "PM2.5" => "PM25",
+        _ => tipo.ToUpperInvariant()
+    };
+}
+
 static bool TentarLerDouble(string texto, out double valor)
 {
     return double.TryParse(texto, NumberStyles.Any, CultureInfo.InvariantCulture, out valor) ||
@@ -437,19 +488,23 @@ static bool UnidadeValida(string tipo, string unidade)
 {
     return tipo.ToUpperInvariant() switch
     {
-        "TEMP" => unidade.Equals("C", StringComparison.OrdinalIgnoreCase) ||
-                  unidade.Equals("ºC", StringComparison.OrdinalIgnoreCase),
-
-        "PM25" => unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
-                  unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
-
-        "HUM" => unidade.Equals("%", StringComparison.OrdinalIgnoreCase),
-
-        "CO2" => unidade.Equals("ppm", StringComparison.OrdinalIgnoreCase),
-
+        "TEMP"  => unidade.Equals("C", StringComparison.OrdinalIgnoreCase) ||
+                   unidade.Equals("ºC", StringComparison.OrdinalIgnoreCase),
+        "PM25"  => unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
+                   unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
+        "PM10"  => unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
+                   unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
+        "HUM"   => unidade.Equals("%", StringComparison.OrdinalIgnoreCase),
+        "CO2"   => unidade.Equals("ppm", StringComparison.OrdinalIgnoreCase),
         "PRESS" => unidade.Equals("hPa", StringComparison.OrdinalIgnoreCase) ||
                    unidade.Equals("Pa", StringComparison.OrdinalIgnoreCase),
-
+        "RUIDO" => unidade.Equals("dB", StringComparison.OrdinalIgnoreCase) ||
+                   unidade.Equals("dBA", StringComparison.OrdinalIgnoreCase),
+        "AR"    => unidade.Equals("AQI", StringComparison.OrdinalIgnoreCase) ||
+                   unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
+                   unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
+        "LUZ"   => unidade.Equals("lux", StringComparison.OrdinalIgnoreCase) ||
+                   unidade.Equals("lx", StringComparison.OrdinalIgnoreCase),
         _ => false
     };
 }
@@ -520,86 +575,54 @@ static void AtualizarAgregado(string agregadoFile, string sensorId, string tipo,
     File.WriteAllLines(agregadoFile, novasLinhas);
 }
 
-static void InicializarBaseDeDados(string masterConnectionString, string dbName, string dbConnectionString)
+static void InicializarBaseDeDados(string dbConnectionString)
 {
-    using (var connection = new SqlConnection(masterConnectionString))
-    {
-        connection.Open();
+    using var connection = new SqliteConnection(dbConnectionString);
+    connection.Open();
 
-        string createDbSql = $@"
-IF DB_ID('{dbName}') IS NULL
-BEGIN
-    CREATE DATABASE [{dbName}]
-END";
-
-        using var cmd = new SqlCommand(createDbSql, connection);
+    string createSensores = @"
+CREATE TABLE IF NOT EXISTS Sensores (
+    SensorId TEXT PRIMARY KEY,
+    Estado TEXT NOT NULL,
+    Zona TEXT NOT NULL,
+    TiposSuportados TEXT NOT NULL,
+    LastSync TEXT NOT NULL
+)";
+    using (var cmd = new SqliteCommand(createSensores, connection))
         cmd.ExecuteNonQuery();
-    }
 
-    using (var connection = new SqlConnection(dbConnectionString))
-    {
-        connection.Open();
-
-        string createTablesSql = @"
-IF OBJECT_ID('Sensores', 'U') IS NULL
-BEGIN
-    CREATE TABLE Sensores (
-        SensorId NVARCHAR(50) PRIMARY KEY,
-        Estado NVARCHAR(50) NOT NULL,
-        Zona NVARCHAR(100) NOT NULL,
-        TiposSuportados NVARCHAR(200) NOT NULL,
-        LastSync DATETIME NOT NULL
-    )
-END
-
-IF OBJECT_ID('MedicoesGateway', 'U') IS NULL
-BEGIN
-    CREATE TABLE MedicoesGateway (
-        Id INT IDENTITY(1,1) PRIMARY KEY,
-        TimestampMedicao DATETIME NOT NULL,
-        GatewayId NVARCHAR(50) NOT NULL,
-        SensorId NVARCHAR(50) NOT NULL,
-        Zona NVARCHAR(100) NOT NULL,
-        Tipo NVARCHAR(50) NOT NULL,
-        Valor FLOAT NOT NULL,
-        Unidade NVARCHAR(50) NOT NULL
-    )
-END";
-
-        using var cmd = new SqlCommand(createTablesSql, connection);
+    string createMedicoes = @"
+CREATE TABLE IF NOT EXISTS MedicoesGateway (
+    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+    TimestampMedicao TEXT NOT NULL,
+    GatewayId TEXT NOT NULL,
+    SensorId TEXT NOT NULL,
+    Zona TEXT NOT NULL,
+    Tipo TEXT NOT NULL,
+    Valor REAL NOT NULL,
+    Unidade TEXT NOT NULL
+)";
+    using (var cmd = new SqliteCommand(createMedicoes, connection))
         cmd.ExecuteNonQuery();
-    }
 }
 
 static void GuardarSensoresNaBaseDeDados(Dictionary<string, SensorInfo> sensorDb, string connectionString)
 {
-    using var connection = new SqlConnection(connectionString);
+    using var connection = new SqliteConnection(connectionString);
     connection.Open();
 
     foreach (var sensor in sensorDb.Values)
     {
         string sql = @"
-IF EXISTS (SELECT 1 FROM Sensores WHERE SensorId = @SensorId)
-BEGIN
-    UPDATE Sensores
-    SET Estado = @Estado,
-        Zona = @Zona,
-        TiposSuportados = @TiposSuportados,
-        LastSync = @LastSync
-    WHERE SensorId = @SensorId
-END
-ELSE
-BEGIN
-    INSERT INTO Sensores (SensorId, Estado, Zona, TiposSuportados, LastSync)
-    VALUES (@SensorId, @Estado, @Zona, @TiposSuportados, @LastSync)
-END";
+INSERT OR REPLACE INTO Sensores (SensorId, Estado, Zona, TiposSuportados, LastSync)
+VALUES (@SensorId, @Estado, @Zona, @TiposSuportados, @LastSync)";
 
-        using var cmd = new SqlCommand(sql, connection);
+        using var cmd = new SqliteCommand(sql, connection);
         cmd.Parameters.AddWithValue("@SensorId", sensor.SensorId);
         cmd.Parameters.AddWithValue("@Estado", sensor.Estado);
         cmd.Parameters.AddWithValue("@Zona", sensor.Zona);
         cmd.Parameters.AddWithValue("@TiposSuportados", string.Join(",", sensor.TiposSuportados));
-        cmd.Parameters.AddWithValue("@LastSync", sensor.LastSync);
+        cmd.Parameters.AddWithValue("@LastSync", sensor.LastSync.ToString("yyyy-MM-ddTHH:mm:ss"));
 
         cmd.ExecuteNonQuery();
     }
@@ -615,7 +638,7 @@ static void GuardarMedicaoGatewayNaBaseDeDados(
     double valor,
     string unidade)
 {
-    using var connection = new SqlConnection(connectionString);
+    using var connection = new SqliteConnection(connectionString);
     connection.Open();
 
     string sql = @"
@@ -624,8 +647,8 @@ INSERT INTO MedicoesGateway
 VALUES
     (@TimestampMedicao, @GatewayId, @SensorId, @Zona, @Tipo, @Valor, @Unidade)";
 
-    using var cmd = new SqlCommand(sql, connection);
-    cmd.Parameters.AddWithValue("@TimestampMedicao", DateTime.Parse(timestamp));
+    using var cmd = new SqliteCommand(sql, connection);
+    cmd.Parameters.AddWithValue("@TimestampMedicao", timestamp);
     cmd.Parameters.AddWithValue("@GatewayId", gatewayId);
     cmd.Parameters.AddWithValue("@SensorId", sensorId);
     cmd.Parameters.AddWithValue("@Zona", zona);

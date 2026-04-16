@@ -282,6 +282,17 @@ ServiceFabricBackup/
 *.ldf
 *.ndf
 
+# SQLite databases (geradas em runtime)
+*.db
+*.db-shm
+*.db-wal
+
+# Ficheiros de dados gerados em runtime
+sensores.txt
+dados_recebidos.txt
+agregado.txt
+dados_*.txt
+
 # Business Intelligence projects
 *.rdl.data
 *.bim.layout

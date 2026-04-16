@@ -1,23 +1,22 @@
-﻿using System;
+using System;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
-using Microsoft.Data.SqlClient;
+using Microsoft.Data.Sqlite;
 
 Console.OutputEncoding = Encoding.UTF8;
 
 const int serverPort = 5000;
-const string dbName = "OneHealthDB";
-const string masterConnectionString = @"Server=(localdb)\MSSQLLocalDB;Integrated Security=true;TrustServerCertificate=true;";
-string dbConnectionString = $@"Server=(localdb)\MSSQLLocalDB;Database={dbName};Integrated Security=true;TrustServerCertificate=true;";
+string dbConnectionString = "Data Source=servidor.db";
 
-// Objeto de exclusão mútua para o ficheiro
-object fileLock = new object();
+// Um lock por tipo de dado → acesso sequencial por ficheiro (protocolo exige mutex por ficheiro)
+var fileLocks = new ConcurrentDictionary<string, object>(StringComparer.OrdinalIgnoreCase);
 
-InicializarBaseDeDados(masterConnectionString, dbName, dbConnectionString);
+InicializarBaseDeDados(dbConnectionString);
 
 TcpListener listener = new TcpListener(IPAddress.Loopback, serverPort);
 listener.Start();
@@ -29,10 +28,10 @@ while (true)
     TcpClient gatewayClient = listener.AcceptTcpClient();
     Console.WriteLine("[SERVIDOR] Gateway ligado.");
 
-    _ = Task.Run(() => HandleGateway(gatewayClient, dbConnectionString, fileLock));
+    _ = Task.Run(() => HandleGateway(gatewayClient, dbConnectionString, fileLocks));
 }
 
-static void HandleGateway(TcpClient client, string dbConnectionString, object fileLock)
+static void HandleGateway(TcpClient client, string dbConnectionString, ConcurrentDictionary<string, object> fileLocks)
 {
     try
     {
@@ -78,9 +77,12 @@ static void HandleGateway(TcpClient client, string dbConnectionString, object fi
 
                             string logLine = $"{timestamp}|{gatewayId}|{sensorId}|{zona}|{tipo}|{valor}|{unidade}";
 
-                            lock (fileLock)
+                            // Guarda em ficheiro específico do tipo de dado
+                            string tipoFicheiro = $"dados_{tipo.ToUpperInvariant()}.txt";
+                            var lockObj = fileLocks.GetOrAdd(tipo, _ => new object());
+                            lock (lockObj)
                             {
-                                File.AppendAllText("dados_servidor.txt", logLine + Environment.NewLine);
+                                File.AppendAllText(tipoFicheiro, logLine + Environment.NewLine);
                             }
 
                             GuardarMedicaoServidorNaBaseDeDados(
@@ -93,7 +95,7 @@ static void HandleGateway(TcpClient client, string dbConnectionString, object fi
                                 valor,
                                 unidade);
 
-                            Console.WriteLine($"[SERVIDOR] Guardado: {logLine}");
+                            Console.WriteLine($"[SERVIDOR] Guardado em {tipoFicheiro}: {logLine}");
                             writer.WriteLine($"SERVER_ACK|{gatewayId}|{sensorId}|{timestamp}|OK");
                         }
                         else
@@ -152,44 +154,24 @@ static void HandleGateway(TcpClient client, string dbConnectionString, object fi
     }
 }
 
-static void InicializarBaseDeDados(string masterConnectionString, string dbName, string dbConnectionString)
+static void InicializarBaseDeDados(string dbConnectionString)
 {
-    using (var connection = new SqlConnection(masterConnectionString))
-    {
-        connection.Open();
+    using var connection = new SqliteConnection(dbConnectionString);
+    connection.Open();
 
-        string createDbSql = $@"
-IF DB_ID('{dbName}') IS NULL
-BEGIN
-    CREATE DATABASE [{dbName}]
-END";
-
-        using var cmd = new SqlCommand(createDbSql, connection);
-        cmd.ExecuteNonQuery();
-    }
-
-    using (var connection = new SqlConnection(dbConnectionString))
-    {
-        connection.Open();
-
-        string createTablesSql = @"
-IF OBJECT_ID('MedicoesServidor', 'U') IS NULL
-BEGIN
-    CREATE TABLE MedicoesServidor (
-        Id INT IDENTITY(1,1) PRIMARY KEY,
-        GatewayId NVARCHAR(50) NOT NULL,
-        SensorId NVARCHAR(50) NOT NULL,
-        Zona NVARCHAR(100) NOT NULL,
-        TimestampMedicao DATETIME NOT NULL,
-        Tipo NVARCHAR(50) NOT NULL,
-        Valor FLOAT NOT NULL,
-        Unidade NVARCHAR(50) NOT NULL
-    )
-END";
-
-        using var cmd = new SqlCommand(createTablesSql, connection);
-        cmd.ExecuteNonQuery();
-    }
+    string createMedicoes = @"
+CREATE TABLE IF NOT EXISTS MedicoesServidor (
+    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+    GatewayId TEXT NOT NULL,
+    SensorId TEXT NOT NULL,
+    Zona TEXT NOT NULL,
+    TimestampMedicao TEXT NOT NULL,
+    Tipo TEXT NOT NULL,
+    Valor REAL NOT NULL,
+    Unidade TEXT NOT NULL
+)";
+    using var cmd = new SqliteCommand(createMedicoes, connection);
+    cmd.ExecuteNonQuery();
 }
 
 static void GuardarMedicaoServidorNaBaseDeDados(
@@ -204,7 +186,7 @@ static void GuardarMedicaoServidorNaBaseDeDados(
 {
     double valor = double.Parse(valorTexto, CultureInfo.InvariantCulture);
 
-    using var connection = new SqlConnection(connectionString);
+    using var connection = new SqliteConnection(connectionString);
     connection.Open();
 
     string sql = @"
@@ -213,11 +195,11 @@ INSERT INTO MedicoesServidor
 VALUES
     (@GatewayId, @SensorId, @Zona, @TimestampMedicao, @Tipo, @Valor, @Unidade)";
 
-    using var cmd = new SqlCommand(sql, connection);
+    using var cmd = new SqliteCommand(sql, connection);
     cmd.Parameters.AddWithValue("@GatewayId", gatewayId);
     cmd.Parameters.AddWithValue("@SensorId", sensorId);
     cmd.Parameters.AddWithValue("@Zona", zona);
-    cmd.Parameters.AddWithValue("@TimestampMedicao", DateTime.Parse(timestamp));
+    cmd.Parameters.AddWithValue("@TimestampMedicao", timestamp);
     cmd.Parameters.AddWithValue("@Tipo", tipo);
     cmd.Parameters.AddWithValue("@Valor", valor);
     cmd.Parameters.AddWithValue("@Unidade", unidade);
