@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Net.Http.Json;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
@@ -13,7 +14,7 @@ Console.OutputEncoding = Encoding.UTF8;
 const int serverPort = 5000;
 string dbConnectionString = "Data Source=servidor.db";
 
-// Um lock por tipo de dado → acesso sequencial por ficheiro (protocolo exige mutex por ficheiro)
+// Um lock por tipo de dado → acesso sequencial por ficheiro
 var fileLocks = new ConcurrentDictionary<string, object>(StringComparer.OrdinalIgnoreCase);
 
 InicializarBaseDeDados(dbConnectionString);
@@ -28,18 +29,26 @@ while (true)
     TcpClient gatewayClient = listener.AcceptTcpClient();
     Console.WriteLine("[SERVIDOR] Gateway ligado.");
 
-    _ = Task.Run(() => HandleGateway(gatewayClient, dbConnectionString, fileLocks));
+    _ = Task.Run(async () =>
+        await HandleGateway(gatewayClient, dbConnectionString, fileLocks));
 }
 
-static void HandleGateway(TcpClient client, string dbConnectionString, ConcurrentDictionary<string, object> fileLocks)
+static async Task HandleGateway(
+    TcpClient client,
+    string dbConnectionString,
+    ConcurrentDictionary<string, object> fileLocks)
 {
     try
     {
         using NetworkStream ns = client.GetStream();
         using StreamReader reader = new StreamReader(ns, Encoding.UTF8);
-        using StreamWriter writer = new StreamWriter(ns, Encoding.UTF8) { AutoFlush = true };
+        using StreamWriter writer = new StreamWriter(ns, Encoding.UTF8)
+        {
+            AutoFlush = true
+        };
 
         string? line;
+
         while ((line = reader.ReadLine()) != null)
         {
             Console.WriteLine($"[SERVIDOR] Recebido: {line}");
@@ -60,6 +69,7 @@ static void HandleGateway(TcpClient client, string dbConnectionString, Concurren
                         {
                             writer.WriteLine("SERVER_NACK|UNKNOWN|UNKNOWN|UNKNOWN|INVALID_FORMAT");
                         }
+
                         break;
                     }
 
@@ -75,14 +85,20 @@ static void HandleGateway(TcpClient client, string dbConnectionString, Concurren
                             string valor = parts[6];
                             string unidade = parts[7];
 
-                            string logLine = $"{timestamp}|{gatewayId}|{sensorId}|{zona}|{tipo}|{valor}|{unidade}";
+                            string logLine =
+                                $"{timestamp}|{gatewayId}|{sensorId}|{zona}|{tipo}|{valor}|{unidade}";
 
-                            // Guarda em ficheiro específico do tipo de dado
-                            string tipoFicheiro = $"dados_{tipo.ToUpperInvariant()}.txt";
+                            // Guarda em ficheiro específico do tipo
+                            string tipoFicheiro =
+                                $"dados_{tipo.ToUpperInvariant()}.txt";
+
                             var lockObj = fileLocks.GetOrAdd(tipo, _ => new object());
+
                             lock (lockObj)
                             {
-                                File.AppendAllText(tipoFicheiro, logLine + Environment.NewLine);
+                                File.AppendAllText(
+                                    tipoFicheiro,
+                                    logLine + Environment.NewLine);
                             }
 
                             GuardarMedicaoServidorNaBaseDeDados(
@@ -95,13 +111,28 @@ static void HandleGateway(TcpClient client, string dbConnectionString, Concurren
                                 valor,
                                 unidade);
 
-                            Console.WriteLine($"[SERVIDOR] Guardado em {tipoFicheiro}: {logLine}");
-                            writer.WriteLine($"SERVER_ACK|{gatewayId}|{sensorId}|{timestamp}|OK");
+                            // RPC → AnalysisService
+                            double valorDouble =
+                                double.Parse(valor, CultureInfo.InvariantCulture);
+
+                            string resultadoAnalise =
+                                await ChamarAnalysisService(tipo, valorDouble);
+
+                            Console.WriteLine(
+                                $"[SERVIDOR] Resultado da análise: {resultadoAnalise}");
+
+                            Console.WriteLine(
+                                $"[SERVIDOR] Guardado em {tipoFicheiro}: {logLine}");
+
+                            writer.WriteLine(
+                                $"SERVER_ACK|{gatewayId}|{sensorId}|{timestamp}|OK");
                         }
                         else
                         {
-                            writer.WriteLine("SERVER_NACK|UNKNOWN|UNKNOWN|UNKNOWN|INVALID_FORMAT");
+                            writer.WriteLine(
+                                "SERVER_NACK|UNKNOWN|UNKNOWN|UNKNOWN|INVALID_FORMAT");
                         }
+
                         break;
                     }
 
@@ -111,14 +142,19 @@ static void HandleGateway(TcpClient client, string dbConnectionString, Concurren
                         {
                             string gatewayId = parts[1];
                             string timestamp = parts[2];
-                            writer.WriteLine($"GW_BYE_ACK|{gatewayId}|{timestamp}|OK");
+
+                            writer.WriteLine(
+                                $"GW_BYE_ACK|{gatewayId}|{timestamp}|OK");
                         }
                         else
                         {
-                            writer.WriteLine("SERVER_NACK|UNKNOWN|UNKNOWN|UNKNOWN|INVALID_FORMAT");
+                            writer.WriteLine(
+                                "SERVER_NACK|UNKNOWN|UNKNOWN|UNKNOWN|INVALID_FORMAT");
                         }
 
-                        Console.WriteLine("[SERVIDOR] Gateway terminou comunicação.");
+                        Console.WriteLine(
+                            "[SERVIDOR] Gateway terminou comunicação.");
+
                         break;
                     }
 
@@ -128,18 +164,26 @@ static void HandleGateway(TcpClient client, string dbConnectionString, Concurren
                         {
                             string gatewayId = parts[1];
                             string timestamp = parts[2];
-                            writer.WriteLine($"GW_HEARTBEAT_ACK|{gatewayId}|{timestamp}|OK");
+
+                            writer.WriteLine(
+                                $"GW_HEARTBEAT_ACK|{gatewayId}|{timestamp}|OK");
                         }
                         else
                         {
-                            writer.WriteLine("SERVER_NACK|UNKNOWN|UNKNOWN|UNKNOWN|INVALID_FORMAT");
+                            writer.WriteLine(
+                                "SERVER_NACK|UNKNOWN|UNKNOWN|UNKNOWN|INVALID_FORMAT");
                         }
+
                         break;
                     }
 
                 default:
-                    writer.WriteLine("SERVER_NACK|UNKNOWN|UNKNOWN|UNKNOWN|UNKNOWN_COMMAND");
-                    break;
+                    {
+                        writer.WriteLine(
+                            "SERVER_NACK|UNKNOWN|UNKNOWN|UNKNOWN|UNKNOWN_COMMAND");
+
+                        break;
+                    }
             }
         }
     }
@@ -154,9 +198,42 @@ static void HandleGateway(TcpClient client, string dbConnectionString, Concurren
     }
 }
 
+static async Task<string> ChamarAnalysisService(
+    string tipo,
+    double valor)
+{
+    try
+    {
+        using HttpClient http = new HttpClient();
+
+        var pedido = new
+        {
+            Tipo = tipo,
+            Valor = valor
+        };
+
+        var resposta = await http.PostAsJsonAsync(
+            "http://localhost:7002/analyze",
+            pedido);
+
+        if (!resposta.IsSuccessStatusCode)
+            return "ERRO_ANALISE";
+
+        var resultado =
+            await resposta.Content.ReadFromJsonAsync<AnalysisResponse>();
+
+        return resultado?.Resultado ?? "SEM_RESULTADO";
+    }
+    catch
+    {
+        return "ANALYSIS_SERVICE_OFFLINE";
+    }
+}
+
 static void InicializarBaseDeDados(string dbConnectionString)
 {
     using var connection = new SqliteConnection(dbConnectionString);
+
     connection.Open();
 
     string createMedicoes = @"
@@ -170,7 +247,9 @@ CREATE TABLE IF NOT EXISTS MedicoesServidor (
     Valor REAL NOT NULL,
     Unidade TEXT NOT NULL
 )";
+
     using var cmd = new SqliteCommand(createMedicoes, connection);
+
     cmd.ExecuteNonQuery();
 }
 
@@ -184,9 +263,11 @@ static void GuardarMedicaoServidorNaBaseDeDados(
     string valorTexto,
     string unidade)
 {
-    double valor = double.Parse(valorTexto, CultureInfo.InvariantCulture);
+    double valor =
+        double.Parse(valorTexto, CultureInfo.InvariantCulture);
 
     using var connection = new SqliteConnection(connectionString);
+
     connection.Open();
 
     string sql = @"
@@ -196,6 +277,7 @@ VALUES
     (@GatewayId, @SensorId, @Zona, @TimestampMedicao, @Tipo, @Valor, @Unidade)";
 
     using var cmd = new SqliteCommand(sql, connection);
+
     cmd.Parameters.AddWithValue("@GatewayId", gatewayId);
     cmd.Parameters.AddWithValue("@SensorId", sensorId);
     cmd.Parameters.AddWithValue("@Zona", zona);
@@ -205,4 +287,11 @@ VALUES
     cmd.Parameters.AddWithValue("@Unidade", unidade);
 
     cmd.ExecuteNonQuery();
+}
+
+class AnalysisResponse
+{
+    public string Tipo { get; set; } = "";
+    public double Valor { get; set; }
+    public string Resultado { get; set; } = "";
 }

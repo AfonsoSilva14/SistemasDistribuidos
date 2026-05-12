@@ -1,5 +1,7 @@
 <Solution>
+  <Project Path="AnalysisService/AnalysisService.csproj" Id="37da4af4-fdaa-4156-8af1-6c13a8032ff0" />
   <Project Path="Gateway/Gateway.csproj" Id="f7d48c7a-d3d5-4594-a059-09b6c6ddbfed" />
+  <Project Path="PreProcessingService/PreProcessingService.csproj" Id="d4a2b00a-6c0f-4f0d-966d-cea4b1133eae" />
   <Project Path="Sensor/Sensor.csproj" Id="89c5edf5-d4fd-455c-91e2-df2e96599afa" />
   <Project Path="Servidor/Servidor.csproj" Id="78fb2e3c-2a8c-440c-a82b-b4549f49bc7b" />
 </Solution>

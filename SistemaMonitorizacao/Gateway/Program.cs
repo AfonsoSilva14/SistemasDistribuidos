@@ -2,27 +2,29 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.Net;
+using System.Net.Http.Json;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
 
 Console.OutputEncoding = Encoding.UTF8;
 
 const string gatewayId = "GW01";
 const string serverIp = "127.0.0.1";
 const int serverPort = 5000;
-const int gatewayPort = 6000;
-const int heartbeatTimeoutSeconds = 60; // sensor sem heartbeat há 60s → manutenção
+const int heartbeatTimeoutSeconds = 60;
 
 const string sensoresFile = "sensores.txt";
 const string dadosRecebidosFile = "dados_recebidos.txt";
 const string agregadoFile = "agregado.txt";
 
+const string exchangeName = "sensores_exchange";
+const string queueName = "gateway_gw01_queue";
+
 string dbConnectionString = "Data Source=gateway.db";
 
-// Locks
 object sensorDbLock = new object();
 object sensoresFileLock = new object();
 object dadosRecebidosFileLock = new object();
@@ -37,7 +39,10 @@ var sensorDb = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCa
         Estado = "ativo",
         Zona = "ZONA_ESCOLAR",
         TiposSuportados = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "TEMP", "PM25", "PM2.5", "PM10", "HUM", "CO2", "PRESS", "RUIDO", "AR", "LUZ" },
+        {
+            "TEMP", "PM25", "PM2.5", "PM10", "HUM", "CO2",
+            "PRESS", "RUIDO", "AR", "LUZ"
+        },
         LastSync = DateTime.Now
     }
 };
@@ -54,6 +59,7 @@ lock (sensorDbLock)
     GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
 }
 
+// Ligação Gateway → Servidor por TCP
 TcpClient serverClient = new TcpClient();
 
 try
@@ -79,12 +85,13 @@ lock (serverConnectionLock)
     Console.WriteLine("[GATEWAY] Resposta do servidor: " + serverReader.ReadLine());
 }
 
-// Deteção de sensores sem heartbeat (executa em background a cada 30s)
+// Verificação de sensores sem heartbeat
 _ = Task.Run(async () =>
 {
     while (true)
     {
         await Task.Delay(TimeSpan.FromSeconds(30));
+
         var now = DateTime.Now;
         bool changed = false;
 
@@ -95,9 +102,10 @@ _ = Task.Run(async () =>
                 if (sensor.Estado.Equals("ativo", StringComparison.OrdinalIgnoreCase))
                 {
                     double elapsed = (now - sensor.LastSync).TotalSeconds;
+
                     if (elapsed > heartbeatTimeoutSeconds)
                     {
-                        Console.WriteLine($"[GATEWAY] Sensor {sensor.SensorId} sem heartbeat há {elapsed:F0}s → marcado como manutenção.");
+                        Console.WriteLine($"[GATEWAY] Sensor {sensor.SensorId} sem heartbeat há {elapsed:F0}s → manutenção.");
                         sensor.Estado = "manutenção";
                         changed = true;
                     }
@@ -111,6 +119,7 @@ _ = Task.Run(async () =>
             {
                 GuardarSensores(sensorDb, sensoresFile);
             }
+
             lock (sensorDbLock)
             {
                 GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
@@ -119,35 +128,79 @@ _ = Task.Run(async () =>
     }
 });
 
-TcpListener listener = new TcpListener(IPAddress.Loopback, gatewayPort);
-listener.Start();
-
-Console.WriteLine($"[GATEWAY] À escuta de sensores em 127.0.0.1:{gatewayPort}...");
-
-while (true)
+// RabbitMQ
+var factory = new ConnectionFactory()
 {
-    TcpClient sensorClient = listener.AcceptTcpClient();
-    Console.WriteLine("[GATEWAY] Sensor ligado.");
+    HostName = "localhost"
+};
 
-    _ = Task.Run(() => HandleSensor(
-        sensorClient,
-        sensorDb,
-        gatewayId,
-        serverWriter,
-        serverReader,
-        sensoresFile,
-        dadosRecebidosFile,
-        agregadoFile,
-        dbConnectionString,
-        sensorDbLock,
-        sensoresFileLock,
-        dadosRecebidosFileLock,
-        agregadoFileLock,
-        serverConnectionLock));
-}
+using var rabbitConnection = factory.CreateConnection();
+using var channel = rabbitConnection.CreateModel();
 
-static void HandleSensor(
-    TcpClient client,
+channel.ExchangeDeclare(
+    exchange: exchangeName,
+    type: ExchangeType.Topic,
+    durable: true,
+    autoDelete: false);
+
+channel.QueueDeclare(
+    queue: queueName,
+    durable: true,
+    exclusive: false,
+    autoDelete: false);
+
+channel.QueueBind(
+    queue: queueName,
+    exchange: exchangeName,
+    routingKey: "zona_escolar.#");
+
+var consumer = new EventingBasicConsumer(channel);
+
+consumer.Received += async (model, ea) =>
+{
+    string message = Encoding.UTF8.GetString(ea.Body.ToArray());
+
+    Console.WriteLine($"[GATEWAY] Recebido via RabbitMQ: {message}");
+
+    try
+    {
+        await ProcessarMensagemSensor(
+            message,
+            sensorDb,
+            gatewayId,
+            serverWriter,
+            serverReader,
+            sensoresFile,
+            dadosRecebidosFile,
+            agregadoFile,
+            dbConnectionString,
+            sensorDbLock,
+            sensoresFileLock,
+            dadosRecebidosFileLock,
+            agregadoFileLock,
+            serverConnectionLock);
+
+        channel.BasicAck(ea.DeliveryTag, false);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("[GATEWAY] Erro ao processar mensagem: " + ex.Message);
+        channel.BasicNack(ea.DeliveryTag, false, true);
+    }
+};
+
+channel.BasicConsume(
+    queue: queueName,
+    autoAck: false,
+    consumer: consumer);
+
+Console.WriteLine("[GATEWAY] A consumir mensagens RabbitMQ.");
+Console.WriteLine("[GATEWAY] Tópicos subscritos: zona_escolar.#");
+Console.WriteLine("[GATEWAY] Pressiona ENTER para terminar.");
+Console.ReadLine();
+
+static async Task ProcessarMensagemSensor(
+    string line,
     Dictionary<string, SensorInfo> sensorDb,
     string gatewayId,
     StreamWriter serverWriter,
@@ -162,313 +215,243 @@ static void HandleSensor(
     object agregadoFileLock,
     object serverConnectionLock)
 {
-    try
+    string[] parts = line.Split('|');
+    string command = parts[0];
+
+    switch (command)
     {
-        using NetworkStream ns = client.GetStream();
-        using StreamReader reader = new StreamReader(ns, Encoding.UTF8);
-        using StreamWriter writer = new StreamWriter(ns, Encoding.UTF8) { AutoFlush = true };
-
-        string? currentSensorId = null;
-        bool authenticated = false;
-        bool typesRegistered = false;
-        HashSet<string> registeredTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        string? line;
-        while ((line = reader.ReadLine()) != null)
-        {
-            Console.WriteLine($"[GATEWAY] Recebido do sensor: {line}");
-
-            string[] parts = line.Split('|');
-            string command = parts[0];
-
-            switch (command)
+        case "DATA":
             {
-                case "HELLO":
-                    {
-                        if (parts.Length < 3)
-                        {
-                            writer.WriteLine("AUTH_FAIL|UNKNOWN|INVALID_FORMAT");
-                            break;
-                        }
-
-                        string sensorId = parts[1];
-                        string zona = parts[2];
-
-                        writer.WriteLine($"HELLO_ACK|{gatewayId}|OK");
-
-                        SensorInfo? sensor;
-                        lock (sensorDbLock)
-                        {
-                            if (!sensorDb.ContainsKey(sensorId))
-                            {
-                                writer.WriteLine($"AUTH_FAIL|{sensorId}|NOT_REGISTERED");
-                                break;
-                            }
-
-                            sensor = sensorDb[sensorId];
-
-                            if (!sensor.Estado.Equals("ativo", StringComparison.OrdinalIgnoreCase))
-                            {
-                                string reason =
-                                    sensor.Estado.Equals("manutenção", StringComparison.OrdinalIgnoreCase) ||
-                                    sensor.Estado.Equals("manutencao", StringComparison.OrdinalIgnoreCase)
-                                        ? "MAINTENANCE"
-                                        : "DISABLED";
-
-                                writer.WriteLine($"AUTH_FAIL|{sensorId}|{reason}");
-                                break;
-                            }
-
-                            if (!sensor.Zona.Equals(zona, StringComparison.OrdinalIgnoreCase))
-                            {
-                                writer.WriteLine($"AUTH_FAIL|{sensorId}|INVALID_ZONE");
-                                break;
-                            }
-
-                            currentSensorId = sensorId;
-                            authenticated = true;
-                            sensor.LastSync = DateTime.Now;
-                        }
-
-                        lock (sensoresFileLock)
-                        {
-                            GuardarSensores(sensorDb, sensoresFile);
-                        }
-
-                        lock (sensorDbLock)
-                        {
-                            GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
-                        }
-
-                        writer.WriteLine($"AUTH_OK|{sensorId}|ativo|{zona}");
-                        break;
-                    }
-
-                case "REGISTER_TYPES":
-                    {
-                        if (!authenticated || currentSensorId == null)
-                        {
-                            writer.WriteLine("REGISTER_NACK|UNKNOWN|NOT_AUTHENTICATED|NONE");
-                            break;
-                        }
-
-                        if (parts.Length < 3)
-                        {
-                            writer.WriteLine($"REGISTER_NACK|{currentSensorId}|INVALID_FORMAT|NONE");
-                            break;
-                        }
-
-                        string sensorId = parts[1];
-                        string[] tipos = parts[2].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-                        if (!sensorId.Equals(currentSensorId, StringComparison.OrdinalIgnoreCase))
-                        {
-                            writer.WriteLine($"REGISTER_NACK|{sensorId}|SENSOR_MISMATCH|NONE");
-                            break;
-                        }
-
-                        List<string> invalidos = new();
-
-                        lock (sensorDbLock)
-                        {
-                            var sensor = sensorDb[currentSensorId];
-
-                            foreach (string tipo in tipos)
-                            {
-                                string tipoNorm = NormalizarTipo(tipo.Trim());
-
-                                if (sensor.TiposSuportados.Contains(tipoNorm) ||
-                                    sensor.TiposSuportados.Contains(tipo.Trim()))
-                                    registeredTypes.Add(tipoNorm);
-                                else
-                                    invalidos.Add(tipoNorm);
-                            }
-                        }
-
-                        if (invalidos.Count > 0)
-                        {
-                            writer.WriteLine($"REGISTER_NACK|{sensorId}|INVALID_TYPES|{string.Join(",", invalidos)}");
-                            break;
-                        }
-
-                        typesRegistered = true;
-                        writer.WriteLine($"REGISTER_ACK|{sensorId}|OK|{string.Join(",", registeredTypes)}");
-                        break;
-                    }
-
-                case "DATA":
-                    {
-                        if (!authenticated || !typesRegistered || currentSensorId == null)
-                        {
-                            writer.WriteLine("DATA_NACK|UNKNOWN|UNKNOWN|NOT_READY");
-                            break;
-                        }
-
-                        if (parts.Length < 6)
-                        {
-                            writer.WriteLine($"DATA_NACK|{currentSensorId}|UNKNOWN|INVALID_FORMAT");
-                            break;
-                        }
-
-                        string sensorId = parts[1];
-                        string timestamp = parts[2];
-                        string tipo = NormalizarTipo(parts[3].Trim());
-                        string valorTexto = parts[4].Trim();
-                        string unidade = parts[5].Trim();
-
-                        if (!sensorId.Equals(currentSensorId, StringComparison.OrdinalIgnoreCase))
-                        {
-                            writer.WriteLine($"DATA_NACK|{sensorId}|{timestamp}|SENSOR_MISMATCH");
-                            break;
-                        }
-
-                        if (!registeredTypes.Contains(tipo))
-                        {
-                            writer.WriteLine($"DATA_NACK|{sensorId}|{timestamp}|UNSUPPORTED_TYPE");
-                            break;
-                        }
-
-                        if (!TentarLerDouble(valorTexto, out double valor))
-                        {
-                            writer.WriteLine($"DATA_NACK|{sensorId}|{timestamp}|INVALID_VALUE");
-                            break;
-                        }
-
-                        if (!UnidadeValida(tipo, unidade))
-                        {
-                            writer.WriteLine($"DATA_NACK|{sensorId}|{timestamp}|INVALID_UNIT");
-                            break;
-                        }
-
-                        valor = Math.Round(valor, 2);
-
-                        string zonaSensor;
-
-                        lock (sensorDbLock)
-                        {
-                            SensorInfo sensor = sensorDb[currentSensorId];
-                            sensor.LastSync = DateTime.Now;
-                            zonaSensor = sensor.Zona;
-                        }
-
-                        lock (sensoresFileLock)
-                        {
-                            GuardarSensores(sensorDb, sensoresFile);
-                        }
-
-                        lock (sensorDbLock)
-                        {
-                            GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
-                        }
-
-                        string linhaDado =
-                            $"{timestamp}|{sensorId}|{zonaSensor}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
-
-                        lock (dadosRecebidosFileLock)
-                        {
-                            File.AppendAllText(dadosRecebidosFile, linhaDado + Environment.NewLine);
-                        }
-
-                        lock (agregadoFileLock)
-                        {
-                            AtualizarAgregado(agregadoFile, sensorId, tipo, valor);
-                        }
-
-                        GuardarMedicaoGatewayNaBaseDeDados(
-                            dbConnectionString,
-                            timestamp,
-                            gatewayId,
-                            sensorId,
-                            zonaSensor,
-                            tipo,
-                            valor,
-                            unidade);
-
-                        writer.WriteLine($"DATA_ACK|{sensorId}|{timestamp}|OK");
-
-                        string gwData =
-                            $"GW_DATA|{gatewayId}|{sensorId}|{zonaSensor}|{timestamp}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
-
-                        string? serverResponse;
-                        lock (serverConnectionLock)
-                        {
-                            serverWriter.WriteLine(gwData);
-                            serverResponse = serverReader.ReadLine();
-                        }
-
-                        Console.WriteLine("[GATEWAY] Resposta do servidor: " + serverResponse);
-                        break;
-                    }
-
-                case "HEARTBEAT":
-                    {
-                        if (!authenticated || currentSensorId == null)
-                        {
-                            writer.WriteLine("HEARTBEAT_ACK|UNKNOWN|UNKNOWN|NOT_AUTHENTICATED");
-                            break;
-                        }
-
-                        if (parts.Length < 3)
-                        {
-                            writer.WriteLine($"HEARTBEAT_ACK|{currentSensorId}|UNKNOWN|INVALID_FORMAT");
-                            break;
-                        }
-
-                        string timestamp = parts[2];
-
-                        lock (sensorDbLock)
-                        {
-                            sensorDb[currentSensorId].LastSync = DateTime.Now;
-                        }
-
-                        lock (sensoresFileLock)
-                        {
-                            GuardarSensores(sensorDb, sensoresFile);
-                        }
-
-                        lock (sensorDbLock)
-                        {
-                            GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
-                        }
-
-                        writer.WriteLine($"HEARTBEAT_ACK|{currentSensorId}|{timestamp}|OK");
-                        break;
-                    }
-
-                case "BYE":
-                    {
-                        if (parts.Length < 3)
-                        {
-                            writer.WriteLine("BYE_ACK|UNKNOWN|UNKNOWN|INVALID_FORMAT");
-                            break;
-                        }
-
-                        string sensorId = parts[1];
-                        string timestamp = parts[2];
-
-                        writer.WriteLine($"BYE_ACK|{sensorId}|{timestamp}|OK");
-                        Console.WriteLine("[GATEWAY] Sensor terminou comunicação.");
-                        return;
-                    }
-
-                default:
-                    writer.WriteLine("ERROR|UNKNOWN_COMMAND");
+                if (parts.Length < 7)
+                {
+                    Console.WriteLine("[GATEWAY] DATA_NACK|UNKNOWN|UNKNOWN|INVALID_FORMAT");
                     break;
+                }
+
+                string sensorId = parts[1];
+                string zonaRecebida = parts[2];
+                string timestamp = parts[3];
+                string tipo = NormalizarTipo(parts[4].Trim());
+                string valorTexto = parts[5].Trim();
+                string unidade = parts[6].Trim();
+
+                if (!sensorDb.ContainsKey(sensorId))
+                {
+                    Console.WriteLine($"[GATEWAY] DATA_NACK|{sensorId}|{timestamp}|SENSOR_NOT_REGISTERED");
+                    break;
+                }
+
+                string zonaSensor;
+
+                lock (sensorDbLock)
+                {
+                    SensorInfo sensor = sensorDb[sensorId];
+
+                    if (!sensor.Estado.Equals("ativo", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine($"[GATEWAY] DATA_NACK|{sensorId}|{timestamp}|SENSOR_NOT_ACTIVE");
+                        break;
+                    }
+
+                    if (!sensor.Zona.Equals(zonaRecebida, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine($"[GATEWAY] DATA_NACK|{sensorId}|{timestamp}|INVALID_ZONE");
+                        break;
+                    }
+
+                    if (!sensor.TiposSuportados.Contains(tipo))
+                    {
+                        Console.WriteLine($"[GATEWAY] DATA_NACK|{sensorId}|{timestamp}|UNSUPPORTED_TYPE");
+                        break;
+                    }
+
+                    sensor.LastSync = DateTime.Now;
+                    zonaSensor = sensor.Zona;
+                }
+
+                if (!TentarLerDouble(valorTexto, out double valor))
+                {
+                    Console.WriteLine($"[GATEWAY] DATA_NACK|{sensorId}|{timestamp}|INVALID_VALUE");
+                    break;
+                }
+
+                if (!UnidadeValida(tipo, unidade))
+                {
+                    Console.WriteLine($"[GATEWAY] DATA_NACK|{sensorId}|{timestamp}|INVALID_UNIT");
+                    break;
+                }
+
+                // RPC → PreProcessingService
+                PreProcessResponse pre = await ChamarPreProcessingService(sensorId, tipo, valor, unidade);
+
+                tipo = pre.Tipo;
+                valor = pre.Valor;
+                unidade = pre.Unidade;
+
+                lock (sensoresFileLock)
+                {
+                    GuardarSensores(sensorDb, sensoresFile);
+                }
+
+                lock (sensorDbLock)
+                {
+                    GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
+                }
+
+                string linhaDado =
+                    $"{timestamp}|{sensorId}|{zonaSensor}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
+
+                lock (dadosRecebidosFileLock)
+                {
+                    File.AppendAllText(dadosRecebidosFile, linhaDado + Environment.NewLine);
+                }
+
+                lock (agregadoFileLock)
+                {
+                    AtualizarAgregado(agregadoFile, sensorId, tipo, valor);
+                }
+
+                GuardarMedicaoGatewayNaBaseDeDados(
+                    dbConnectionString,
+                    timestamp,
+                    gatewayId,
+                    sensorId,
+                    zonaSensor,
+                    tipo,
+                    valor,
+                    unidade);
+
+                Console.WriteLine($"[GATEWAY] DATA_ACK|{sensorId}|{timestamp}|OK");
+
+                string gwData =
+                    $"GW_DATA|{gatewayId}|{sensorId}|{zonaSensor}|{timestamp}|{tipo}|{valor.ToString("F2", CultureInfo.InvariantCulture)}|{unidade}";
+
+                string? serverResponse;
+
+                lock (serverConnectionLock)
+                {
+                    serverWriter.WriteLine(gwData);
+                    serverResponse = serverReader.ReadLine();
+                }
+
+                Console.WriteLine("[GATEWAY] Resposta do servidor: " + serverResponse);
+                break;
             }
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[GATEWAY] Erro: {ex.Message}");
-    }
-    finally
-    {
-        client.Close();
-        Console.WriteLine("[GATEWAY] Ligação ao sensor fechada.");
+
+        case "HEARTBEAT":
+            {
+                if (parts.Length < 4)
+                {
+                    Console.WriteLine("[GATEWAY] HEARTBEAT_ACK|UNKNOWN|UNKNOWN|INVALID_FORMAT");
+                    break;
+                }
+
+                string sensorId = parts[1];
+                string zonaRecebida = parts[2];
+                string timestamp = parts[3];
+
+                lock (sensorDbLock)
+                {
+                    if (sensorDb.ContainsKey(sensorId) &&
+                        sensorDb[sensorId].Zona.Equals(zonaRecebida, StringComparison.OrdinalIgnoreCase))
+                    {
+                        sensorDb[sensorId].LastSync = DateTime.Now;
+                    }
+                }
+
+                lock (sensoresFileLock)
+                {
+                    GuardarSensores(sensorDb, sensoresFile);
+                }
+
+                lock (sensorDbLock)
+                {
+                    GuardarSensoresNaBaseDeDados(sensorDb, dbConnectionString);
+                }
+
+                Console.WriteLine($"[GATEWAY] HEARTBEAT_ACK|{sensorId}|{timestamp}|OK");
+                break;
+            }
+
+        case "BYE":
+            {
+                if (parts.Length < 4)
+                {
+                    Console.WriteLine("[GATEWAY] BYE_ACK|UNKNOWN|UNKNOWN|INVALID_FORMAT");
+                    break;
+                }
+
+                string sensorId = parts[1];
+                string zona = parts[2];
+                string timestamp = parts[3];
+
+                Console.WriteLine($"[GATEWAY] BYE_ACK|{sensorId}|{zona}|{timestamp}|OK");
+                break;
+            }
+
+        default:
+            {
+                Console.WriteLine("[GATEWAY] ERROR|UNKNOWN_COMMAND");
+                break;
+            }
     }
 }
 
-// Normaliza nomes de tipos: PM2.5 → PM25
+static async Task<PreProcessResponse> ChamarPreProcessingService(
+    string sensorId,
+    string tipo,
+    double valor,
+    string unidade)
+{
+    try
+    {
+        using HttpClient http = new HttpClient();
+
+        var pedido = new
+        {
+            SensorId = sensorId,
+            Tipo = tipo,
+            Valor = valor,
+            Unidade = unidade
+        };
+
+        var resposta = await http.PostAsJsonAsync(
+            "http://localhost:7001/preprocess",
+            pedido);
+
+        if (!resposta.IsSuccessStatusCode)
+        {
+            return new PreProcessResponse
+            {
+                SensorId = sensorId,
+                Tipo = tipo,
+                Valor = Math.Round(valor, 2),
+                Unidade = unidade
+            };
+        }
+
+        var resultado = await resposta.Content.ReadFromJsonAsync<PreProcessResponse>();
+
+        return resultado ?? new PreProcessResponse
+        {
+            SensorId = sensorId,
+            Tipo = tipo,
+            Valor = Math.Round(valor, 2),
+            Unidade = unidade
+        };
+    }
+    catch
+    {
+        return new PreProcessResponse
+        {
+            SensorId = sensorId,
+            Tipo = tipo,
+            Valor = Math.Round(valor, 2),
+            Unidade = unidade
+        };
+    }
+}
+
 static string NormalizarTipo(string tipo)
 {
     return tipo.ToUpperInvariant() switch
@@ -488,23 +471,23 @@ static bool UnidadeValida(string tipo, string unidade)
 {
     return tipo.ToUpperInvariant() switch
     {
-        "TEMP"  => unidade.Equals("C", StringComparison.OrdinalIgnoreCase) ||
-                   unidade.Equals("ºC", StringComparison.OrdinalIgnoreCase),
-        "PM25"  => unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
-                   unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
-        "PM10"  => unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
-                   unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
-        "HUM"   => unidade.Equals("%", StringComparison.OrdinalIgnoreCase),
-        "CO2"   => unidade.Equals("ppm", StringComparison.OrdinalIgnoreCase),
+        "TEMP" => unidade.Equals("C", StringComparison.OrdinalIgnoreCase) ||
+                  unidade.Equals("ºC", StringComparison.OrdinalIgnoreCase),
+        "PM25" => unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
+                  unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
+        "PM10" => unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
+                  unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
+        "HUM" => unidade.Equals("%", StringComparison.OrdinalIgnoreCase),
+        "CO2" => unidade.Equals("ppm", StringComparison.OrdinalIgnoreCase),
         "PRESS" => unidade.Equals("hPa", StringComparison.OrdinalIgnoreCase) ||
                    unidade.Equals("Pa", StringComparison.OrdinalIgnoreCase),
         "RUIDO" => unidade.Equals("dB", StringComparison.OrdinalIgnoreCase) ||
                    unidade.Equals("dBA", StringComparison.OrdinalIgnoreCase),
-        "AR"    => unidade.Equals("AQI", StringComparison.OrdinalIgnoreCase) ||
-                   unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
-                   unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
-        "LUZ"   => unidade.Equals("lux", StringComparison.OrdinalIgnoreCase) ||
-                   unidade.Equals("lx", StringComparison.OrdinalIgnoreCase),
+        "AR" => unidade.Equals("AQI", StringComparison.OrdinalIgnoreCase) ||
+                unidade.Equals("ug/m3", StringComparison.OrdinalIgnoreCase) ||
+                unidade.Equals("µg/m3", StringComparison.OrdinalIgnoreCase),
+        "LUZ" => unidade.Equals("lux", StringComparison.OrdinalIgnoreCase) ||
+                 unidade.Equals("lx", StringComparison.OrdinalIgnoreCase),
         _ => false
     };
 }
@@ -535,6 +518,7 @@ static void AtualizarAgregado(string agregadoFile, string sensorId, string tipo,
         foreach (string linha in linhas)
         {
             string[] parts = linha.Split('|');
+
             if (parts.Length == 4)
             {
                 string sId = parts[0];
@@ -588,6 +572,7 @@ CREATE TABLE IF NOT EXISTS Sensores (
     TiposSuportados TEXT NOT NULL,
     LastSync TEXT NOT NULL
 )";
+
     using (var cmd = new SqliteCommand(createSensores, connection))
         cmd.ExecuteNonQuery();
 
@@ -602,6 +587,7 @@ CREATE TABLE IF NOT EXISTS MedicoesGateway (
     Valor REAL NOT NULL,
     Unidade TEXT NOT NULL
 )";
+
     using (var cmd = new SqliteCommand(createMedicoes, connection))
         cmd.ExecuteNonQuery();
 }
@@ -648,6 +634,7 @@ VALUES
     (@TimestampMedicao, @GatewayId, @SensorId, @Zona, @Tipo, @Valor, @Unidade)";
 
     using var cmd = new SqliteCommand(sql, connection);
+
     cmd.Parameters.AddWithValue("@TimestampMedicao", timestamp);
     cmd.Parameters.AddWithValue("@GatewayId", gatewayId);
     cmd.Parameters.AddWithValue("@SensorId", sensorId);
@@ -666,4 +653,12 @@ class SensorInfo
     public string Zona { get; set; } = "";
     public HashSet<string> TiposSuportados { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public DateTime LastSync { get; set; }
+}
+
+class PreProcessResponse
+{
+    public string SensorId { get; set; } = "";
+    public string Tipo { get; set; } = "";
+    public double Valor { get; set; }
+    public string Unidade { get; set; } = "";
 }
