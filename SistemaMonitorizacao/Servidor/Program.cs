@@ -118,8 +118,23 @@ static async Task HandleGateway(
                             string resultadoAnalise =
                                 await ChamarAnalysisService(tipo, valorDouble);
 
+                            // Persistir o resultado da análise na base de dados
+                            GuardarAnaliseNaBaseDeDados(
+                                dbConnectionString,
+                                DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss"),
+                                tipo, sensorId, zona,
+                                periodoInicio: timestamp,
+                                periodoFim: timestamp,
+                                quantidade: 1,
+                                media: valorDouble,
+                                minimo: valorDouble,
+                                maximo: valorDouble,
+                                desvioPadrao: 0,
+                                tendencia: "TEMPO_REAL",
+                                resultado: resultadoAnalise);
+
                             Console.WriteLine(
-                                $"[SERVIDOR] Resultado da análise: {resultadoAnalise}");
+                                $"[SERVIDOR] Resultado da análise: {resultadoAnalise} (guardado na BD)");
 
                             Console.WriteLine(
                                 $"[SERVIDOR] Guardado em {tipoFicheiro}: {logLine}");
@@ -248,7 +263,72 @@ CREATE TABLE IF NOT EXISTS MedicoesServidor (
     Unidade TEXT NOT NULL
 )";
 
-    using var cmd = new SqliteCommand(createMedicoes, connection);
+    using (var cmd = new SqliteCommand(createMedicoes, connection))
+        cmd.ExecuteNonQuery();
+
+    string createAnalises = @"
+CREATE TABLE IF NOT EXISTS Analises (
+    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+    TimestampAnalise TEXT NOT NULL,
+    Tipo TEXT NOT NULL,
+    SensorId TEXT,
+    Zona TEXT,
+    PeriodoInicio TEXT,
+    PeriodoFim TEXT,
+    Quantidade INTEGER NOT NULL,
+    Media REAL,
+    Minimo REAL,
+    Maximo REAL,
+    DesvioPadrao REAL,
+    Tendencia TEXT,
+    Resultado TEXT NOT NULL
+)";
+
+    using (var cmd = new SqliteCommand(createAnalises, connection))
+        cmd.ExecuteNonQuery();
+}
+
+static void GuardarAnaliseNaBaseDeDados(
+    string connectionString,
+    string timestampAnalise,
+    string tipo,
+    string sensorId,
+    string zona,
+    string periodoInicio,
+    string periodoFim,
+    int quantidade,
+    double media,
+    double minimo,
+    double maximo,
+    double desvioPadrao,
+    string tendencia,
+    string resultado)
+{
+    using var connection = new SqliteConnection(connectionString);
+    connection.Open();
+
+    string sql = @"
+INSERT INTO Analises
+    (TimestampAnalise, Tipo, SensorId, Zona, PeriodoInicio, PeriodoFim,
+     Quantidade, Media, Minimo, Maximo, DesvioPadrao, Tendencia, Resultado)
+VALUES
+    (@TimestampAnalise, @Tipo, @SensorId, @Zona, @PeriodoInicio, @PeriodoFim,
+     @Quantidade, @Media, @Minimo, @Maximo, @DesvioPadrao, @Tendencia, @Resultado)";
+
+    using var cmd = new SqliteCommand(sql, connection);
+    cmd.Parameters.AddWithValue("@TimestampAnalise", timestampAnalise);
+    cmd.Parameters.AddWithValue("@Tipo", tipo);
+    cmd.Parameters.AddWithValue("@SensorId", sensorId);
+    cmd.Parameters.AddWithValue("@Zona", zona);
+    cmd.Parameters.AddWithValue("@PeriodoInicio", periodoInicio);
+    cmd.Parameters.AddWithValue("@PeriodoFim", periodoFim);
+    cmd.Parameters.AddWithValue("@Quantidade", quantidade);
+    cmd.Parameters.AddWithValue("@Media", media);
+    cmd.Parameters.AddWithValue("@Minimo", minimo);
+    cmd.Parameters.AddWithValue("@Maximo", maximo);
+    cmd.Parameters.AddWithValue("@DesvioPadrao", desvioPadrao);
+    cmd.Parameters.AddWithValue("@Tendencia", tendencia);
+    cmd.Parameters.AddWithValue("@Resultado", resultado);
 
     cmd.ExecuteNonQuery();
 }
