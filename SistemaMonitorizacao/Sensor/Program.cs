@@ -44,7 +44,7 @@ _ = Task.Run(async () =>
         if (running)
         {
             string timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
-            string msg = $"HEARTBEAT|{sensorId}|{timestamp}";
+            string msg = $"HEARTBEAT|{sensorId}|{zona}|{timestamp}";
 
             Publicar(
                 channel,

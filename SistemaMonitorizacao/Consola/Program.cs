@@ -20,15 +20,58 @@ using Microsoft.Data.Sqlite;
 
 Console.OutputEncoding = Encoding.UTF8;
 
-// Caminho para a BD do Servidor (1.º argumento ou caminho relativo por omissão)
-string dbPath = args.Length > 0 ? args[0] : "../Servidor/servidor.db";
+// Caminho para a BD do Servidor.
+// O servidor.db é criado na pasta de trabalho do Servidor — que difere
+// consoante seja lançado por `dotnet run` (Servidor/servidor.db) ou pelo
+// Visual Studio (Servidor/bin/Debug/net8.0/servidor.db). Procuramos em
+// todas as localizações plausíveis, subindo a árvore de diretórios.
+string dbPath = ResolverCaminhoBD(args);
 string dbConnectionString = $"Data Source={dbPath}";
 const string analysisUrl = "http://localhost:7002/analyze-batch";
+
+static string ResolverCaminhoBD(string[] args)
+{
+    if (args.Length > 0 && File.Exists(args[0]))
+        return Path.GetFullPath(args[0]);
+
+    var candidatos = new List<string>
+    {
+        "servidor.db",
+        Path.Combine("..", "Servidor", "servidor.db"),
+        Path.Combine("..", "Servidor", "bin", "Debug", "net8.0", "servidor.db"),
+    };
+
+    // Sobe a árvore a partir do executável e do diretório atual
+    foreach (var raiz in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
+    {
+        var dir = new DirectoryInfo(raiz);
+        while (dir != null)
+        {
+            candidatos.Add(Path.Combine(dir.FullName, "servidor.db"));
+            candidatos.Add(Path.Combine(dir.FullName, "Servidor", "servidor.db"));
+            candidatos.Add(Path.Combine(dir.FullName, "Servidor", "bin", "Debug", "net8.0", "servidor.db"));
+            candidatos.Add(Path.Combine(dir.FullName, "SistemaMonitorizacao", "Servidor", "servidor.db"));
+            candidatos.Add(Path.Combine(dir.FullName, "SistemaMonitorizacao", "Servidor", "bin", "Debug", "net8.0", "servidor.db"));
+            dir = dir.Parent;
+        }
+    }
+
+    foreach (var c in candidatos)
+        if (File.Exists(c))
+            return Path.GetFullPath(c);
+
+    // Nada encontrado: devolve o melhor palpite (erro será claro)
+    return args.Length > 0 ? args[0] : Path.Combine("..", "Servidor", "servidor.db");
+}
 
 Console.WriteLine("=================================================");
 Console.WriteLine(" INTERFACE DE VISUALIZAÇÃO E ANÁLISE — One Health ");
 Console.WriteLine("=================================================");
-Console.WriteLine($"Base de dados: {dbPath}");
+if (File.Exists(dbPath))
+    Console.WriteLine($"Base de dados: {dbPath}");
+else
+    Console.WriteLine($"AVISO: não encontrei servidor.db. Arranca o Servidor primeiro " +
+                      $"(ou passa o caminho como argumento). Tentado: {dbPath}");
 Console.WriteLine();
 
 bool running = true;
@@ -41,7 +84,7 @@ while (running)
     Console.WriteLine("4 - Resumo geral (contagem por tipo)");
     Console.WriteLine("0 - Sair");
     Console.Write("Opção: ");
-    string? op = Console.ReadLine();
+    string? op = Console.ReadLine()?.Trim();
     Console.WriteLine();
 
     switch (op)
