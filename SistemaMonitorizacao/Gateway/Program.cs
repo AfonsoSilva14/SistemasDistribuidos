@@ -17,6 +17,7 @@ const int serverPort = 5000;
 const int heartbeatTimeoutSeconds = 60;
 
 const string sensoresFile = "sensores.txt";
+const string sensoresConfigFile = "sensores_config.csv";
 const string dadosRecebidosFile = "dados_recebidos.txt";
 const string agregadoFile = "agregado.txt";
 
@@ -31,21 +32,7 @@ object dadosRecebidosFileLock = new object();
 object agregadoFileLock = new object();
 object serverConnectionLock = new object();
 
-var sensorDb = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCase)
-{
-    ["S102"] = new SensorInfo
-    {
-        SensorId = "S102",
-        Estado = "ativo",
-        Zona = "ZONA_ESCOLAR",
-        TiposSuportados = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "TEMP", "PM25", "PM2.5", "PM10", "HUM", "CO2",
-            "PRESS", "RUIDO", "AR", "LUZ"
-        },
-        LastSync = DateTime.Now
-    }
-};
+var sensorDb = CarregarSensoresConfigurados(sensoresConfigFile);
 
 lock (sensoresFileLock)
 {
@@ -149,10 +136,18 @@ channel.QueueDeclare(
     exclusive: false,
     autoDelete: false);
 
-channel.QueueBind(
-    queue: queueName,
-    exchange: exchangeName,
-    routingKey: "zona_escolar.#");
+var zonasSubscritas = sensorDb.Values
+    .Select(sensor => sensor.Zona.ToLowerInvariant())
+    .Distinct(StringComparer.OrdinalIgnoreCase)
+    .ToList();
+
+foreach (string zonaSubscrita in zonasSubscritas)
+{
+    channel.QueueBind(
+        queue: queueName,
+        exchange: exchangeName,
+        routingKey: $"{zonaSubscrita}.#");
+}
 
 var consumer = new EventingBasicConsumer(channel);
 
@@ -195,9 +190,80 @@ channel.BasicConsume(
     consumer: consumer);
 
 Console.WriteLine("[GATEWAY] A consumir mensagens RabbitMQ.");
-Console.WriteLine("[GATEWAY] Tópicos subscritos: zona_escolar.#");
+Console.WriteLine("[GATEWAY] Topicos subscritos: " +
+                  string.Join(", ", zonasSubscritas.Select(z => $"{z}.#")));
 Console.WriteLine("[GATEWAY] Pressiona ENTER para terminar.");
 Console.ReadLine();
+
+static Dictionary<string, SensorInfo> CarregarSensoresConfigurados(string sensoresConfigFile)
+{
+    CriarConfigSensoresPorDefeito(sensoresConfigFile);
+
+    var sensores = new Dictionary<string, SensorInfo>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (string linha in File.ReadAllLines(sensoresConfigFile))
+    {
+        string trimmed = linha.Trim();
+        if (trimmed.Length == 0 || trimmed.StartsWith("#"))
+            continue;
+
+        string[] parts = trimmed.Split(';', StringSplitOptions.TrimEntries);
+        if (parts.Length < 4)
+        {
+            Console.WriteLine($"[GATEWAY] Linha ignorada em {sensoresConfigFile}: {linha}");
+            continue;
+        }
+
+        string sensorId = parts[0];
+        string zona = parts[1];
+        string estado = parts[2];
+        string[] tipos = parts[3].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        if (sensorId.Length == 0 || zona.Length == 0 || tipos.Length == 0)
+        {
+            Console.WriteLine($"[GATEWAY] Linha incompleta ignorada em {sensoresConfigFile}: {linha}");
+            continue;
+        }
+
+        sensores[sensorId] = new SensorInfo
+        {
+            SensorId = sensorId,
+            Estado = estado.Length == 0 ? "ativo" : estado,
+            Zona = zona,
+            TiposSuportados = new HashSet<string>(
+                tipos.Select(NormalizarTipo),
+                StringComparer.OrdinalIgnoreCase),
+            LastSync = DateTime.Now
+        };
+    }
+
+    if (sensores.Count == 0)
+    {
+        throw new InvalidOperationException(
+            $"Nao existem sensores validos em {sensoresConfigFile}.");
+    }
+
+    Console.WriteLine($"[GATEWAY] Sensores carregados: {sensores.Count}");
+    return sensores;
+}
+
+static void CriarConfigSensoresPorDefeito(string sensoresConfigFile)
+{
+    if (File.Exists(sensoresConfigFile))
+        return;
+
+    var linhas = new[]
+    {
+        "# SensorId;Zona;Estado;TiposSuportados",
+        "S102;ZONA_ESCOLAR;ativo;TEMP,PM25,PM10,HUM,CO2,PRESS,RUIDO,AR,LUZ",
+        "S103;ZONA_ESCOLAR;ativo;TEMP,HUM,CO2",
+        "S201;ZONA_CENTRO;ativo;PM25,PM10,RUIDO,AR",
+        "S301;ZONA_PARQUE;ativo;TEMP,HUM,LUZ"
+    };
+
+    File.WriteAllLines(sensoresConfigFile, linhas);
+    Console.WriteLine($"[GATEWAY] Criado ficheiro de configuracao: {sensoresConfigFile}");
+}
 
 static async Task ProcessarMensagemSensor(
     string line,
@@ -469,6 +535,16 @@ static bool TentarLerDouble(string texto, out double valor)
 
 static bool UnidadeValida(string tipo, string unidade)
 {
+    string t = tipo.ToUpperInvariant();
+    string u = NormalizarUnidade(unidade);
+
+    if (t == "TEMP" && (u is "c" or "oc" or "f" or "of" or "k"))
+        return true;
+    if ((t == "PM25" || t == "PM10" || t == "AR") && (u is "ug/m3" or "mg/m3" or "aqi"))
+        return true;
+    if (t == "PRESS" && (u is "hpa" or "pa" or "kpa"))
+        return true;
+
     return tipo.ToUpperInvariant() switch
     {
         "TEMP" => unidade.Equals("C", StringComparison.OrdinalIgnoreCase) ||
@@ -490,6 +566,18 @@ static bool UnidadeValida(string tipo, string unidade)
                  unidade.Equals("lx", StringComparison.OrdinalIgnoreCase),
         _ => false
     };
+}
+
+static string NormalizarUnidade(string unidade)
+{
+    return unidade
+        .Trim()
+        .ToLowerInvariant()
+        .Replace("Â", "")
+        .Replace("º", "o")
+        .Replace("°", "o")
+        .Replace("µ", "u")
+        .Replace("μ", "u");
 }
 
 static void GuardarSensores(Dictionary<string, SensorInfo> sensorDb, string sensoresFile)

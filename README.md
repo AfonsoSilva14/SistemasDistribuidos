@@ -80,3 +80,10 @@ cd SistemaMonitorizacao/Consola && dotnet run
 |--------|----------|-------------|-----------|
 | POST | `/analyze` | Servidor (tempo real) | `{Tipo,Valor}` → classificação de risco |
 | POST | `/analyze-batch` | Consola | `{Tipo,Valores:[...]}` → média, mín, máx, desvio-padrão, tendência, risco |
+## Funcionalidades extra implementadas
+
+- Gateway com configuracao multi-sensor em `SistemaMonitorizacao/Gateway/sensores_config.csv`.
+- Suporte multi-zona: o Gateway subscreve automaticamente as zonas dos sensores configurados.
+- Modo automatico no Sensor: `dotnet run -- S103 ZONA_ESCOLAR --auto --interval 5`.
+- Alertas persistidos no Servidor quando a analise devolve resultado diferente de `NORMAL`.
+- Consola com dashboard operacional, consulta/resolucao de alertas e exportacao para CSV/JSON.

@@ -15,6 +15,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 
@@ -82,6 +83,10 @@ while (running)
     Console.WriteLine("2 - Pedir nova análise estatística (parametrizada)");
     Console.WriteLine("3 - Ver histórico de análises");
     Console.WriteLine("4 - Resumo geral (contagem por tipo)");
+    Console.WriteLine("5 - Dashboard operacional");
+    Console.WriteLine("6 - Ver alertas");
+    Console.WriteLine("7 - Exportar dados");
+    Console.WriteLine("8 - Marcar alerta como resolvido");
     Console.WriteLine("0 - Sair");
     Console.Write("Opção: ");
     string? op = Console.ReadLine()?.Trim();
@@ -93,6 +98,10 @@ while (running)
         case "2": await PedirAnalise(dbConnectionString, analysisUrl); break;
         case "3": VerHistoricoAnalises(dbConnectionString); break;
         case "4": ResumoGeral(dbConnectionString); break;
+        case "5": DashboardOperacional(dbConnectionString); break;
+        case "6": VerAlertas(dbConnectionString); break;
+        case "7": ExportarDados(dbConnectionString); break;
+        case "8": MarcarAlertaResolvido(dbConnectionString); break;
         case "0": running = false; break;
         default: Console.WriteLine("Opção inválida."); break;
     }
@@ -304,6 +313,213 @@ static void ResumoGeral(string cs)
         Console.WriteLine(new string('-', 48));
     }
     catch (Exception ex) { Console.WriteLine("Erro: " + ex.Message); }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Dashboard operacional
+// ---------------------------------------------------------------------------
+static void DashboardOperacional(string cs)
+{
+    try
+    {
+        using var con = new SqliteConnection(cs);
+        con.Open();
+
+        int totalMedicoes = ExecutarScalarInt(con, "SELECT COUNT(*) FROM MedicoesServidor");
+        int sensores = ExecutarScalarInt(con, "SELECT COUNT(DISTINCT SensorId) FROM MedicoesServidor");
+        int zonas = ExecutarScalarInt(con, "SELECT COUNT(DISTINCT Zona) FROM MedicoesServidor");
+        int alertas = TabelaExiste(con, "Alertas")
+            ? ExecutarScalarInt(con, "SELECT COUNT(*) FROM Alertas WHERE Resolvido = 0")
+            : 0;
+
+        Console.WriteLine("========= DASHBOARD =========");
+        Console.WriteLine($" Medicoes ........ {totalMedicoes}");
+        Console.WriteLine($" Sensores ........ {sensores}");
+        Console.WriteLine($" Zonas ........... {zonas}");
+        Console.WriteLine($" Alertas ativos .. {alertas}");
+        Console.WriteLine("=============================");
+
+        using var cmd = new SqliteCommand(
+            @"SELECT SensorId, Zona, MAX(TimestampMedicao), COUNT(*)
+              FROM MedicoesServidor
+              GROUP BY SensorId, Zona
+              ORDER BY MAX(TimestampMedicao) DESC", con);
+        using var r = cmd.ExecuteReader();
+
+        Console.WriteLine();
+        Console.WriteLine($"{"Sensor",-8} {"Zona",-14} {"Ultima medicao",-20} {"Qtd",6}");
+        Console.WriteLine(new string('-', 56));
+        while (r.Read())
+        {
+            Console.WriteLine($"{r.GetString(0),-8} {r.GetString(1),-14} {r.GetString(2),-20} {r.GetInt32(3),6}");
+        }
+    }
+    catch (Exception ex) { Console.WriteLine("Erro: " + ex.Message); }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Alertas
+// ---------------------------------------------------------------------------
+static void VerAlertas(string cs)
+{
+    try
+    {
+        using var con = new SqliteConnection(cs);
+        con.Open();
+        if (!TabelaExiste(con, "Alertas"))
+        {
+            Console.WriteLine("Tabela Alertas ainda nao existe. Arranca o Servidor atualizado primeiro.");
+            return;
+        }
+
+        using var cmd = new SqliteCommand(
+            @"SELECT Id, TimestampAlerta, SensorId, Zona, Tipo, Valor, Unidade, Resultado, Resolvido
+              FROM Alertas
+              ORDER BY Id DESC LIMIT 30", con);
+        using var r = cmd.ExecuteReader();
+
+        Console.WriteLine($"{"Id",4} {"Quando",-20} {"Sensor",-8} {"Zona",-14} {"Tipo",-7} {"Valor",9} {"Un",-6} {"Resultado",-24} {"Res.",5}");
+        Console.WriteLine(new string('-', 106));
+        int n = 0;
+        while (r.Read())
+        {
+            Console.WriteLine($"{r.GetInt32(0),4} {r.GetString(1),-20} {r.GetString(2),-8} {r.GetString(3),-14} " +
+                              $"{r.GetString(4),-7} {r.GetDouble(5),9:F2} {r.GetString(6),-6} {r.GetString(7),-24} {r.GetInt32(8),5}");
+            n++;
+        }
+        Console.WriteLine(new string('-', 106));
+        Console.WriteLine($"{n} alerta(s).");
+    }
+    catch (Exception ex) { Console.WriteLine("Erro: " + ex.Message); }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Exportacao de dados
+// ---------------------------------------------------------------------------
+static void ExportarDados(string cs)
+{
+    try
+    {
+        using var con = new SqliteConnection(cs);
+        con.Open();
+
+        ExportarCsv(
+            con,
+            "medicoes_export.csv",
+            @"SELECT TimestampMedicao, GatewayId, SensorId, Zona, Tipo, Valor, Unidade
+              FROM MedicoesServidor ORDER BY Id",
+            new[] { "TimestampMedicao", "GatewayId", "SensorId", "Zona", "Tipo", "Valor", "Unidade" });
+
+        ExportarJson(
+            con,
+            "analises_export.json",
+            @"SELECT TimestampAnalise, Tipo, SensorId, Zona, Quantidade, Media, Minimo, Maximo,
+                     DesvioPadrao, Tendencia, Resultado
+              FROM Analises ORDER BY Id");
+
+        if (TabelaExiste(con, "Alertas"))
+        {
+            ExportarCsv(
+                con,
+                "alertas_export.csv",
+                @"SELECT TimestampAlerta, GatewayId, SensorId, Zona, Tipo, Valor, Unidade, Resultado, Resolvido
+                  FROM Alertas ORDER BY Id",
+                new[] { "TimestampAlerta", "GatewayId", "SensorId", "Zona", "Tipo", "Valor", "Unidade", "Resultado", "Resolvido" });
+        }
+
+        Console.WriteLine("Exportacao concluida: medicoes_export.csv, analises_export.json e alertas_export.csv.");
+    }
+    catch (Exception ex) { Console.WriteLine("Erro: " + ex.Message); }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Resolver alertas
+// ---------------------------------------------------------------------------
+static void MarcarAlertaResolvido(string cs)
+{
+    try
+    {
+        using var con = new SqliteConnection(cs);
+        con.Open();
+        if (!TabelaExiste(con, "Alertas"))
+        {
+            Console.WriteLine("Tabela Alertas ainda nao existe. Arranca o Servidor atualizado primeiro.");
+            return;
+        }
+
+        Console.Write("Id do alerta a resolver: ");
+        string idTxt = (Console.ReadLine() ?? "").Trim();
+        if (!int.TryParse(idTxt, out int id) || id <= 0)
+        {
+            Console.WriteLine("Id invalido.");
+            return;
+        }
+
+        using var cmd = new SqliteCommand(
+            "UPDATE Alertas SET Resolvido = 1 WHERE Id = @Id", con);
+        cmd.Parameters.AddWithValue("@Id", id);
+        int afetados = cmd.ExecuteNonQuery();
+
+        Console.WriteLine(afetados == 0
+            ? "Alerta nao encontrado."
+            : "Alerta marcado como resolvido.");
+    }
+    catch (Exception ex) { Console.WriteLine("Erro: " + ex.Message); }
+}
+
+static int ExecutarScalarInt(SqliteConnection con, string sql)
+{
+    using var cmd = new SqliteCommand(sql, con);
+    object? value = cmd.ExecuteScalar();
+    return Convert.ToInt32(value ?? 0, CultureInfo.InvariantCulture);
+}
+
+static bool TabelaExiste(SqliteConnection con, string nome)
+{
+    using var cmd = new SqliteCommand(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = @Nome", con);
+    cmd.Parameters.AddWithValue("@Nome", nome);
+    return Convert.ToInt32(cmd.ExecuteScalar() ?? 0, CultureInfo.InvariantCulture) > 0;
+}
+
+static void ExportarCsv(SqliteConnection con, string caminho, string sql, string[] headers)
+{
+    var linhas = new List<string> { string.Join(",", headers.Select(EscaparCsv)) };
+    using var cmd = new SqliteCommand(sql, con);
+    using var r = cmd.ExecuteReader();
+    while (r.Read())
+    {
+        var valores = new List<string>();
+        for (int i = 0; i < r.FieldCount; i++)
+            valores.Add(EscaparCsv(r.GetValue(i)?.ToString() ?? ""));
+        linhas.Add(string.Join(",", valores));
+    }
+
+    File.WriteAllLines(caminho, linhas, Encoding.UTF8);
+}
+
+static void ExportarJson(SqliteConnection con, string caminho, string sql)
+{
+    var linhas = new List<Dictionary<string, object?>>();
+    using var cmd = new SqliteCommand(sql, con);
+    using var r = cmd.ExecuteReader();
+    while (r.Read())
+    {
+        var item = new Dictionary<string, object?>();
+        for (int i = 0; i < r.FieldCount; i++)
+            item[r.GetName(i)] = r.IsDBNull(i) ? null : r.GetValue(i);
+        linhas.Add(item);
+    }
+
+    var json = JsonSerializer.Serialize(linhas, new JsonSerializerOptions { WriteIndented = true });
+    File.WriteAllText(caminho, json, Encoding.UTF8);
+}
+
+static string EscaparCsv(string valor)
+{
+    if (valor.Contains('"') || valor.Contains(',') || valor.Contains('\n') || valor.Contains('\r'))
+        return "\"" + valor.Replace("\"", "\"\"") + "\"";
+    return valor;
 }
 
 

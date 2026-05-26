@@ -133,6 +133,20 @@ static async Task HandleGateway(
                                 tendencia: "TEMPO_REAL",
                                 resultado: resultadoAnalise);
 
+                            if (!resultadoAnalise.Equals("NORMAL", StringComparison.OrdinalIgnoreCase))
+                            {
+                                GuardarAlertaNaBaseDeDados(
+                                    dbConnectionString,
+                                    DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss"),
+                                    gatewayId,
+                                    sensorId,
+                                    zona,
+                                    tipo,
+                                    valorDouble,
+                                    unidade,
+                                    resultadoAnalise);
+                            }
+
                             Console.WriteLine(
                                 $"[SERVIDOR] Resultado da análise: {resultadoAnalise} (guardado na BD)");
 
@@ -286,6 +300,23 @@ CREATE TABLE IF NOT EXISTS Analises (
 
     using (var cmd = new SqliteCommand(createAnalises, connection))
         cmd.ExecuteNonQuery();
+
+    string createAlertas = @"
+CREATE TABLE IF NOT EXISTS Alertas (
+    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+    TimestampAlerta TEXT NOT NULL,
+    GatewayId TEXT NOT NULL,
+    SensorId TEXT NOT NULL,
+    Zona TEXT NOT NULL,
+    Tipo TEXT NOT NULL,
+    Valor REAL NOT NULL,
+    Unidade TEXT NOT NULL,
+    Resultado TEXT NOT NULL,
+    Resolvido INTEGER NOT NULL DEFAULT 0
+)";
+
+    using (var cmd = new SqliteCommand(createAlertas, connection))
+        cmd.ExecuteNonQuery();
 }
 
 static void GuardarAnaliseNaBaseDeDados(
@@ -365,6 +396,39 @@ VALUES
     cmd.Parameters.AddWithValue("@Tipo", tipo);
     cmd.Parameters.AddWithValue("@Valor", valor);
     cmd.Parameters.AddWithValue("@Unidade", unidade);
+
+    cmd.ExecuteNonQuery();
+}
+
+static void GuardarAlertaNaBaseDeDados(
+    string connectionString,
+    string timestampAlerta,
+    string gatewayId,
+    string sensorId,
+    string zona,
+    string tipo,
+    double valor,
+    string unidade,
+    string resultado)
+{
+    using var connection = new SqliteConnection(connectionString);
+    connection.Open();
+
+    string sql = @"
+INSERT INTO Alertas
+    (TimestampAlerta, GatewayId, SensorId, Zona, Tipo, Valor, Unidade, Resultado)
+VALUES
+    (@TimestampAlerta, @GatewayId, @SensorId, @Zona, @Tipo, @Valor, @Unidade, @Resultado)";
+
+    using var cmd = new SqliteCommand(sql, connection);
+    cmd.Parameters.AddWithValue("@TimestampAlerta", timestampAlerta);
+    cmd.Parameters.AddWithValue("@GatewayId", gatewayId);
+    cmd.Parameters.AddWithValue("@SensorId", sensorId);
+    cmd.Parameters.AddWithValue("@Zona", zona);
+    cmd.Parameters.AddWithValue("@Tipo", tipo);
+    cmd.Parameters.AddWithValue("@Valor", valor);
+    cmd.Parameters.AddWithValue("@Unidade", unidade);
+    cmd.Parameters.AddWithValue("@Resultado", resultado);
 
     cmd.ExecuteNonQuery();
 }
