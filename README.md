@@ -28,6 +28,7 @@ SENSOR ──publica──►  sensores_exchange  ──subscreve──►  GATE
 | Componente | Tecnologia | Papel |
 |------------|-----------|-------|
 | **Sensor** | C# / RabbitMQ.Client | Publica medições e heartbeats em tópicos `zona.tipo` |
+| **SensorSimulatorPython** | Python / pika | Simulador alternativo de sensores; publica no mesmo RabbitMQ e acrescenta um componente noutra linguagem |
 | **Gateway** | C# / RabbitMQ + SQLite | Subscreve tópicos da sua zona, valida, invoca pré-processamento (RPC), agrega, reencaminha ao Servidor |
 | **PreProcessingService** | **C#** (ASP.NET minimal API) | RPC — uniformização: normaliza tipos, **converte escalas/unidades** (F→C, K→C, Pa→hPa, mg/m³→µg/m³) |
 | **Servidor** | C# / SQLite | Persiste medições, invoca análise (RPC) e **persiste resultados das análises** |
@@ -63,6 +64,11 @@ cd SistemaMonitorizacao/Gateway && dotnet run
 # 5. Sensor  (args opcionais: <sensorId> <zona>)
 cd SistemaMonitorizacao/Sensor && dotnet run -- S102 ZONA_ESCOLAR
 
+# 5b. Sensor alternativo em Python (opcional, fator de valorizacao)
+cd SistemaMonitorizacao/SensorSimulatorPython
+pip install -r requirements.txt
+python sensor_simulator.py --sensor-id S102 --zona ZONA_ESCOLAR --interval 5
+
 # 6. Interface CLI (a qualquer momento, lê a BD do Servidor)
 cd SistemaMonitorizacao/Consola && dotnet run
 ```
@@ -85,5 +91,6 @@ cd SistemaMonitorizacao/Consola && dotnet run
 - Gateway com configuracao multi-sensor em `SistemaMonitorizacao/Gateway/sensores_config.csv`.
 - Suporte multi-zona: o Gateway subscreve automaticamente as zonas dos sensores configurados.
 - Modo automatico no Sensor: `dotnet run -- S103 ZONA_ESCOLAR --auto --interval 5`.
+- Simulador de sensor em Python em `SistemaMonitorizacao/SensorSimulatorPython`, acrescentando um componente noutra linguagem.
 - Alertas persistidos no Servidor quando a analise devolve resultado diferente de `NORMAL`.
 - Consola com dashboard operacional, consulta/resolucao de alertas e exportacao para CSV/JSON.
