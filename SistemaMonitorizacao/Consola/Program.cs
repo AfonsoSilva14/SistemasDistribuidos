@@ -57,12 +57,45 @@ static string ResolverCaminhoBD(string[] args)
         }
     }
 
-    foreach (var c in candidatos)
-        if (File.Exists(c))
-            return Path.GetFullPath(c);
+    var existentes = candidatos
+        .Select(Path.GetFullPath)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Where(File.Exists)
+        .ToList();
+
+    if (existentes.Count > 0)
+    {
+        return existentes
+            .OrderByDescending(ContarMedicoesNaBD)
+            .ThenByDescending(p => File.GetLastWriteTimeUtc(p))
+            .First();
+    }
 
     // Nada encontrado: devolve o melhor palpite (erro será claro)
     return args.Length > 0 ? args[0] : Path.Combine("..", "Servidor", "servidor.db");
+}
+
+static int ContarMedicoesNaBD(string caminho)
+{
+    try
+    {
+        using var connection = new SqliteConnection($"Data Source={caminho}");
+        connection.Open();
+
+        using var cmd = new SqliteCommand(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'MedicoesServidor'",
+            connection);
+
+        if (Convert.ToInt32(cmd.ExecuteScalar(), CultureInfo.InvariantCulture) == 0)
+            return 0;
+
+        cmd.CommandText = "SELECT COUNT(*) FROM MedicoesServidor";
+        return Convert.ToInt32(cmd.ExecuteScalar(), CultureInfo.InvariantCulture);
+    }
+    catch
+    {
+        return 0;
+    }
 }
 
 Console.WriteLine("=================================================");
